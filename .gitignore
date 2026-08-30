@@ -1,0 +1,17 @@
+# secrets / local
+.env
+
+# cache / generated
+.cache/
+__pycache__/
+*.log
+timings/
+
+# corpus PDFs are large (~200MB) - keep in docs/ but not versioned by default
+# uncomment to track:
+# !docs/*.pdf
+docs/*.pdf
+
+# OS / editor
+.DS_Store
+Thumbs.db
