@@ -33,6 +33,7 @@ from reconcile import (
     extract_doi,
     make_evidence,
     normalize_arxiv,
+    normalize_doi,
     reconcile_document,
 )
 from split_refs import split_bib
@@ -114,17 +115,13 @@ def _parse_reference(raw: str) -> dict:
 def _enrich_ref_with_evidence(ref: dict) -> bool:
     """Add deterministic evidence fields to a {index, raw} ref if missing. Returns True if mutated."""
     raw = ref.get("raw", "")
-    # keep already-parsed evidence if present and raw unchanged; only fill missing
-    has_evidence = any(k in ref for k in ("doi", "arxiv", "year"))
-    if has_evidence:
-        # still ensure evidence matches current raw (raw is stable, but if raw changed, re-parse)
-        # for minimal, keep existing; no mutation needed if already has evidence
-        return False
     parsed = _parse_reference(raw)
-    if parsed:
-        ref.update(parsed)
-        return True
-    return False
+    mutated = False
+    for k, v in parsed.items():
+        if k not in ref:
+            ref[k] = v
+            mutated = True
+    return mutated
 
 
 def _migrate_refs_cache(refs_cache: dict) -> bool:
@@ -153,6 +150,56 @@ def _migrate_refs_cache(refs_cache: dict) -> bool:
                 if _enrich_ref_with_evidence(r):
                     mutated = True
     return mutated
+
+
+def _canonical_strong_id(ref: dict) -> tuple[str | None, str | None]:
+    """Return (paper_id, via) for strong IDs only (doi/arxiv), else (None, None)."""
+    doi = ref.get("doi")
+    if doi:
+        norm = normalize_doi(doi)
+        if norm:
+            return f"doi:{norm}", "doi"
+    arxiv = ref.get("arxiv")
+    if arxiv:
+        base, _ = normalize_arxiv(arxiv)
+        if base:
+            return f"arxiv:{base}", "arxiv"
+    return None, None
+
+
+def _get_or_create_paper_for_ref(papers: dict, ref: dict) -> tuple[str | None, str | None]:
+    """Get or create minimal paper for a strong-ID ref. Returns (paper_id, via) or (None, None)."""
+    paper_id, via = _canonical_strong_id(ref)
+    if not paper_id:
+        return None, None
+    if paper_id in papers:
+        return paper_id, via
+    # create minimal paper from strong identifier only — no invented title/authors/year beyond evidence
+    doi = ref.get("doi")
+    arxiv = ref.get("arxiv")
+    arxiv_version = ref.get("arxiv_version")
+    # normalize via helpers for consistency
+    norm_doi = normalize_doi(doi) if doi else None
+    norm_arxiv, norm_version = normalize_arxiv(arxiv) if arxiv else (None, None)
+    # use provided version if present, else normalized
+    version = arxiv_version or norm_version
+    evidence = make_evidence(title="", authors=[], doi=norm_doi, arxiv=norm_arxiv, arxiv_version=version)
+    # build minimal paper record
+    papers[paper_id] = {
+        "id": paper_id,
+        "doi": evidence.get("doi"),
+        "arxiv": evidence.get("arxiv"),
+        "arxiv_version": evidence.get("arxiv_version"),
+        "title": "",
+        "title_norm": "",
+        "authors": [],
+        "authors_norm": [],
+        "documents": [],
+    }
+    # keep year if present in ref evidence and not inventing otherwise
+    if ref.get("year"):
+        papers[paper_id]["year"] = ref["year"]
+    return paper_id, via
 
 
 def identify_pdf(pdf: Path) -> dict:
@@ -478,22 +525,142 @@ def main(argv=None):
         )
         new_cnt += 1
 
-    save_json(MANIFEST, manifest)
-    save_json(PAPERS, papers)
-    save_json(GRAPH, graph)
-    if refs_dirty or refs_written:
+    # --- strong-ID reference resolution + citation edges (no network, no fuzzy) ---
+    refs_resolved = 0
+    refs_unresolved = 0
+    arxiv_resolved = 0
+    doi_resolved = 0
+    # track if refs/papers/edges were mutated during resolution
+    refs_resolve_dirty = False
+    papers_before = len(papers)
+    # build deduplicated edges from resolved refs
+    edge_set = set()
+    # preload existing edges to keep idempotency (if graph already has edges, preserve set)
+    for e in graph.get("edges", []):
+        # support both {"from","to"} and {"source","target"}
+        src = e.get("from") or e.get("source")
+        tgt = e.get("to") or e.get("target")
+        if src and tgt:
+            edge_set.add((src, tgt))
+    # resolve each ref
+    for doc_sha, entry in refs_cache.items():
+        manifest_entry = manifest.get(doc_sha)
+        if not manifest_entry or not manifest_entry.get("paper_id"):
+            continue
+        source_paper = manifest_entry["paper_id"]
+        # ensure source paper exists in papers (should, via reconciliation)
+        if source_paper not in papers:
+            continue
+        for ref in entry.get("refs", []):
+            # if already resolved and points to existing paper, count and keep edge
+            if ref.get("status") == "resolved" and ref.get("paper_id") and ref.get("paper_id") in papers:
+                # ensure edge exists for already-resolved refs (idempotent, no rewrite if already present)
+                tgt = ref["paper_id"]
+                if (source_paper, tgt) not in edge_set:
+                    edge_set.add((source_paper, tgt))
+                    refs_resolve_dirty = True
+                # count for reporting
+                via = ref.get("resolved_via")
+                if via == "arxiv":
+                    arxiv_resolved += 1
+                elif via == "doi":
+                    doi_resolved += 1
+                refs_resolved += 1
+                continue
+            # need strong ID
+            paper_id, via = _get_or_create_paper_for_ref(papers, ref)
+            if not paper_id:
+                refs_unresolved += 1
+                continue
+            # mark ref as resolved — preserve raw/index, add only resolution fields
+            if ref.get("paper_id") != paper_id or ref.get("status") != "resolved" or ref.get("resolved_via") != via:
+                ref["paper_id"] = paper_id
+                ref["status"] = "resolved"
+                ref["resolved_via"] = via
+                refs_resolve_dirty = True
+            # deduplicate edge but keep each ref addressable
+            if (source_paper, paper_id) not in edge_set:
+                edge_set.add((source_paper, paper_id))
+                refs_resolve_dirty = True
+            if via == "arxiv":
+                arxiv_resolved += 1
+            elif via == "doi":
+                doi_resolved += 1
+            refs_resolved += 1
+    # count unresolved (refs without strong ID or without paper_id after attempt)
+    if refs_resolved == 0 and refs_unresolved == 0:
+        # we counted only resolved in loop; need to count unresolved by scanning
+        for entry in refs_cache.values():
+            for ref in entry.get("refs", []):
+                if ref.get("status") != "resolved":
+                    # check if it has strong ID but was not resolved due to missing via? Actually all with doi/arxiv should be resolved now
+                    # so remaining unresolved are those without doi/arxiv
+                    if "paper_id" not in ref:
+                        refs_unresolved += 1
+        # adjust double-count: refs_resolved already counted, refs_unresolved now correct
+        # but we already incremented unresolved for those without strong ID during loop; need to ensure not double
+        # Simpler: recompute totals for reporting
+        arxiv_resolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("resolved_via") == "arxiv")
+        doi_resolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("resolved_via") == "doi")
+        refs_resolved = arxiv_resolved + doi_resolved
+        refs_unresolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("status") != "resolved")
+    # rebuild graph: nodes are papers (not documents), edges are deduplicated citations
+    # deterministically sort for idempotency
+    new_nodes = sorted(papers.values(), key=lambda p: p["id"])
+    new_edges = sorted([{"from": s, "to": t} for s, t in edge_set], key=lambda e: (e["from"], e["to"]))
+    graph_dirty = False
+    if len(graph.get("nodes", [])) != len(new_nodes) or any(n["id"] not in {x["id"] for x in new_nodes} for n in graph.get("nodes", [])):
+        graph["nodes"] = new_nodes
+        graph_dirty = True
+    else:
+        # check if nodes content differs (e.g., new papers added)
+        existing_ids = {n["id"] for n in graph.get("nodes", [])}
+        new_ids = {n["id"] for n in new_nodes}
+        if existing_ids != new_ids:
+            graph["nodes"] = new_nodes
+            graph_dirty = True
+    # edges
+    existing_edges_set = {(e.get("from") or e.get("source"), e.get("to") or e.get("target")) for e in graph.get("edges", [])}
+    if existing_edges_set != edge_set:
+        graph["edges"] = new_edges
+        graph_dirty = True
+    else:
+        # ensure sorted order even if same set
+        if graph.get("edges", []) != new_edges:
+            graph["edges"] = new_edges
+            graph_dirty = True
+
+    manifest_dirty = new_cnt > 0 or reconcile_cnt > 0
+    if manifest_dirty:
+        save_json(MANIFEST, manifest)
+    papers_dirty = len(papers) != papers_before or refs_resolve_dirty
+    if papers_dirty:
+        save_json(PAPERS, papers)
+    if graph_dirty:
+        save_json(GRAPH, graph)
+    elif not GRAPH.exists():
+        save_json(GRAPH, graph)
+    refs_needs_save = refs_dirty or refs_written or refs_resolve_dirty or refs_migrated
+    if refs_needs_save:
         save_json(REFS, refs_cache)
-    elif refs_migrated:
-        # migration already flagged dirty, save to persist new shape
-        save_json(REFS, refs_cache)
+
+    # recompute totals for report (in case we double-counted earlier)
+    total_refs = sum(len(e.get("refs", [])) for e in refs_cache.values())
+    arxiv_resolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("resolved_via") == "arxiv")
+    doi_resolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("resolved_via") == "doi")
+    refs_resolved = arxiv_resolved + doi_resolved
+    refs_unresolved = total_refs - refs_resolved
 
     print(
         f"\ndone: scanned={len(pdfs)} new={new_cnt} reconciled={reconcile_cnt}"
         f" skip={skip_cnt} refs_written={refs_written}"
     )
     print(
-        f"identity: documents={len(manifest)} papers={len(papers)}"
-        f"  refs={len(refs_cache)} docs  stores={MANIFEST}, {PAPERS}, {REFS}"
+        f"refs: total={total_refs}  arxiv={arxiv_resolved}  doi={doi_resolved}  unresolved={refs_unresolved}"
+    )
+    print(
+        f"identity: documents={len(manifest)} papers={len(papers)} (was {papers_before})"
+        f"  edges={len(new_edges)}  stores={MANIFEST}, {PAPERS}, {REFS}, {GRAPH}"
     )
     return 0
 
