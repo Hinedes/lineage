@@ -96,14 +96,15 @@ def _migrate_refs_cache(refs_cache: dict) -> bool:
             entry["refs"] = [{"index": i, "raw": s} for i, s in enumerate(refs)]
             mutated = True
         elif isinstance(refs[0], dict):
-            # ensure sequential indexes 0..N-1 and raw preserved (fix if drifted)
+            # repair index only, preserve every other field (paper_id, status, etc.)
             needs_fix = False
             for i, r in enumerate(refs):
                 if r.get("index") != i or "raw" not in r:
                     needs_fix = True
                     break
             if needs_fix:
-                entry["refs"] = [{"index": i, "raw": r.get("raw", "")} for i, r in enumerate(refs)]
+                for i, r in enumerate(refs):
+                    r["index"] = i
                 mutated = True
     return mutated
 
