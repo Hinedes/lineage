@@ -104,7 +104,7 @@ def identify_pdf(pdf: Path) -> dict:
                 title = collapsed[:220].split("  ")[0].strip() if collapsed else name
 
         if meta_author:
-            authors = [meta_author]
+            authors = meta_author
         else:
             authors = extract_authors_from_front_page(first_page, title)
 
