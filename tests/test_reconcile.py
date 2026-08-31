@@ -2,6 +2,7 @@ import unittest
 
 from reconcile import (
     authors_compatible,
+    extract_arxiv,
     make_evidence,
     normalize_title,
     parse_author_list,
@@ -19,6 +20,10 @@ class ReconcileTests(unittest.TestCase):
     def test_title_normalization_keeps_semantic_hyphen(self):
         self.assertNotEqual(normalize_title("GPT-4"), normalize_title("GPT 4"))
 
+    def test_metadata_author_string_splits_into_people(self):
+        authors = parse_author_list("John Smith, Alice Doe")
+        self.assertEqual([a["surname"] for a in authors], ["smith", "doe"])
+
     def test_initial_can_match_full_given_name(self):
         a = parse_author_list(["John Smith", "Alice Doe"])
         b = parse_author_list(["J. Smith", "A. Doe"])
@@ -28,6 +33,11 @@ class ReconcileTests(unittest.TestCase):
         a = parse_author_list(["John Smith"])
         b = parse_author_list(["Joseph Smith"])
         self.assertFalse(authors_compatible(a, b))
+
+    def test_explicit_arxiv_marker_keeps_version_separate(self):
+        base, version = extract_arxiv("arXiv:2203.05482v3 [cs.LG] 1 Jul 2022")
+        self.assertEqual(base, "2203.05482")
+        self.assertEqual(version, "v3")
 
     def test_arxiv_versions_reconcile_to_one_paper(self):
         papers = {}
