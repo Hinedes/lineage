@@ -85,6 +85,29 @@ def _normalize_stamp_date(s: str | None) -> str | None:
     return None
 
 
+def _migrate_refs_cache(refs_cache: dict) -> bool:
+    """Migrate old string refs to {index, raw} objects. Returns True if mutated."""
+    mutated = False
+    for entry in refs_cache.values():
+        refs = entry.get("refs", [])
+        if not refs:
+            continue
+        if isinstance(refs[0], str):
+            entry["refs"] = [{"index": i, "raw": s} for i, s in enumerate(refs)]
+            mutated = True
+        elif isinstance(refs[0], dict):
+            # ensure sequential indexes 0..N-1 and raw preserved (fix if drifted)
+            needs_fix = False
+            for i, r in enumerate(refs):
+                if r.get("index") != i or "raw" not in r:
+                    needs_fix = True
+                    break
+            if needs_fix:
+                entry["refs"] = [{"index": i, "raw": r.get("raw", "")} for i, r in enumerate(refs)]
+                mutated = True
+    return mutated
+
+
 def identify_pdf(pdf: Path) -> dict:
     """Read paper identity evidence from the PDF, using filename only as fallback."""
     name = pdf.name
@@ -271,7 +294,9 @@ def main(argv=None):
     manifest = load_json(MANIFEST, {})
     papers = load_json(PAPERS, {})
     graph = load_json(GRAPH, {"nodes": [], "edges": []})
-    refs_cache = load_json(REFS, {})  # sha256 -> {mode, refs: [str]}
+    refs_cache = load_json(REFS, {})  # sha256 -> {mode, refs: [{index, raw}]}
+    # backward compat: migrate old string refs to object refs
+    refs_migrated = _migrate_refs_cache(refs_cache)
     graph.setdefault("nodes", [])
     graph.setdefault("edges", [])
 
@@ -283,6 +308,7 @@ def main(argv=None):
 
     new_cnt = skip_cnt = reconcile_cnt = refs_written = 0
     seen_this_run = set()
+    refs_dirty = refs_migrated
 
     for pdf in pdfs:
         h = sha256_file(pdf)
@@ -296,16 +322,21 @@ def main(argv=None):
         needs_reconciliation = not existing or not existing.get("paper_id")
 
         if existing and not needs_reconciliation:
-            # ensure refs are cached even for skips (backfill for older caches)
+            # ensure refs are cached even for skips (backfill/migrate)
             if h not in refs_cache:
                 ident_tmp = identify_pdf(pdf)
                 rec_tmp = ingest_one(pdf, h, ident_tmp)
-                refs_cache[h] = {"mode": rec_tmp.get("mode"), "refs": rec_tmp.get("refs", [])}
+                refs_cache[h] = {
+                    "mode": rec_tmp.get("mode"),
+                    "refs": [{"index": i, "raw": s} for i, s in enumerate(rec_tmp.get("refs", []))],
+                }
                 refs_written += 1
+                refs_dirty = True
                 print(
                     f"backfill {pdf.name}  {h[:8]}  refs={rec_tmp.get('references',0):3}  mode={rec_tmp.get('mode')}"
                 )
             else:
+                # already in new object format due to _migrate_refs_cache; no rewrite needed
                 print(
                     f"skip  {pdf.name}  {h[:8]}  already integrated"
                     f"  paper={existing['paper_id']}"
@@ -332,11 +363,15 @@ def main(argv=None):
                     "version": ident.get("version"),
                     "authors": ident.get("authors", []),
                 })
-            # also backfill refs for this reconciled document
+            # also backfill refs for this reconciled document in new object format
             if h not in refs_cache:
                 rec_tmp = ingest_one(pdf, h, ident)
-                refs_cache[h] = {"mode": rec_tmp.get("mode"), "refs": rec_tmp.get("refs", [])}
+                refs_cache[h] = {
+                    "mode": rec_tmp.get("mode"),
+                    "refs": [{"index": i, "raw": s} for i, s in enumerate(rec_tmp.get("refs", []))],
+                }
                 refs_written += 1
+                refs_dirty = True
             print(
                 f"recon {pdf.name}  {h[:8]}  paper={paper_id}"
                 f"  via={recon_status}"
@@ -348,9 +383,13 @@ def main(argv=None):
         rec["paper_id"] = paper_id
         rec["reconciliation"] = recon_status
 
-        # cache the split refs (not thrown away)
-        refs_cache[h] = {"mode": rec.get("mode"), "refs": rec.get("refs", [])}
+        # cache the split refs as stable per-reference records (index + raw)
+        refs_cache[h] = {
+            "mode": rec.get("mode"),
+            "refs": [{"index": i, "raw": s} for i, s in enumerate(rec.get("refs", []))],
+        }
         refs_written += 1
+        refs_dirty = True
         # don't duplicate large refs array in graph node — keep count there
         rec_for_graph = {k: v for k, v in rec.items() if k != "refs"}
 
@@ -377,7 +416,11 @@ def main(argv=None):
     save_json(MANIFEST, manifest)
     save_json(PAPERS, papers)
     save_json(GRAPH, graph)
-    save_json(REFS, refs_cache)
+    if refs_dirty or refs_written:
+        save_json(REFS, refs_cache)
+    elif refs_migrated:
+        # migration already flagged dirty, save to persist new shape
+        save_json(REFS, refs_cache)
 
     print(
         f"\ndone: scanned={len(pdfs)} new={new_cnt} reconciled={reconcile_cnt}"
