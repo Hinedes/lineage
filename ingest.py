@@ -10,6 +10,7 @@ Identity:
   - document = sha256(pdf bytes)
   - paper reconciliation = DOI -> arXiv base ID -> normalized title + authors
   - arXiv version is document metadata, not paper identity
+  - side stamp "arXiv:2203.05482v3 [cs.LG] 1 Jul 2022" is robust, filename-independent
 
 Stores:
   .cache/lineage2.json  documents
@@ -36,6 +37,9 @@ from reconcile import (
 from split_refs import split_bib
 
 ARXIV_FN = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?", re.I)
+# vertical side stamp unique to arXiv PDFs — filename-independent, survives renames
+# e.g. "arXiv:2203.05482v3  [cs.LG]  1 Jul 2022" (pypdf extracts vertical at page tail)
+ARXIV_STAMP = re.compile(r"arXiv:\s*(\d{4}\.\d{4,5})(v\d+)\s*\[([^\]]+)\]\s*(\d+\s+\w+\s+\d{4})", re.I)
 ARXIV_DATE = re.compile(r"(\d{2})(\d{2})\.\d+")
 YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 
@@ -74,15 +78,24 @@ def identify_pdf(pdf: Path) -> dict:
     arxiv = None
     version = None
     first_page = ""
+    arxiv_stamp = None
+    arxiv_category = None
+    stamp_date = None
 
     try:
         reader = PdfReader(str(pdf))
         if reader.pages:
             first_page = reader.pages[0].extract_text() or ""
 
-        # Prefer the explicit arXiv marker inside the PDF text. pypdf also
-        # extracts the rotated margin marker used by arXiv PDFs.
-        arxiv, version = extract_arxiv(first_page)
+        m_stamp = ARXIV_STAMP.search(first_page)
+        if m_stamp:
+            arxiv = m_stamp.group(1).casefold()
+            version = m_stamp.group(2).casefold() if m_stamp.group(2) else None
+            arxiv_category = m_stamp.group(3)
+            stamp_date = m_stamp.group(4)
+            arxiv_stamp = m_stamp.group(0)
+        else:
+            arxiv, version = extract_arxiv(first_page)
 
         meta = reader.metadata
         meta_title = (meta.title or "").strip() if meta else ""
@@ -124,16 +137,21 @@ def identify_pdf(pdf: Path) -> dict:
         if not title:
             title = name
 
-    return {
+    out = {
         "filename": name,
         "arxiv": arxiv,
         "version": version,
-        "arxiv_date": _arxiv_date(arxiv),
+        "arxiv_date": stamp_date or _arxiv_date(arxiv),
         "doi": doi,
         "year": year,
         "title": title[:220],
         "authors": authors,
     }
+    if arxiv_stamp:
+        out["arxiv_stamp"] = arxiv_stamp
+    if arxiv_category:
+        out["arxiv_category"] = arxiv_category
+    return out
 
 
 def load_json(path: Path, default):
@@ -204,7 +222,6 @@ def reconcile_pdf(papers: dict, ident: dict, h: str) -> tuple[str, str]:
 
 def main(argv=None):
     argv = argv or sys.argv[1:]
-
     if "--clear" in argv:
         for p in (MANIFEST, PAPERS, GRAPH):
             if p.exists():
@@ -262,7 +279,6 @@ def main(argv=None):
         paper_id, recon_status = reconcile_pdf(papers, ident, h)
 
         if existing:
-            # Migration path for caches created before paper reconciliation existed.
             existing.update({
                 **ident,
                 "paper_id": paper_id,
