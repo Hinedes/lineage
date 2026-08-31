@@ -1,6 +1,6 @@
 import unittest
 
-from ingest import _get_or_create_paper_for_ref, _parse_reference
+from ingest import _get_or_create_paper_for_ref, _migrate_papers_cache, _parse_reference
 from reconcile import make_evidence, reconcile_document
 
 
@@ -116,6 +116,7 @@ class RefStrongIdTests(unittest.TestCase):
         # both identifiers stored on single paper
         self.assertEqual(papers[p_doi]["doi"], "10.1234/x")
         self.assertEqual(papers[p_doi]["arxiv"], "2401.12345")
+        self.assertNotIn("arxiv_version", papers[p_doi])
         # edges dedup
         source = "arxiv:9999.00000"
         papers[source] = {"id": source, "arxiv": "9999.00000", "title": "", "title_norm": "", "authors": [], "authors_norm": [], "documents": []}
@@ -144,6 +145,7 @@ class RefStrongIdTests(unittest.TestCase):
         self.assertEqual(len(papers), 1)
         self.assertEqual(papers[p_arxiv]["doi"], "10.1234/x")
         self.assertEqual(papers[p_arxiv]["arxiv"], "2401.12345")
+        self.assertNotIn("arxiv_version", papers[p_arxiv])
         source = "arxiv:9999.00001"
         papers[source] = {"id": source, "arxiv": "9999.00001", "title": "", "title_norm": "", "authors": [], "authors_norm": [], "documents": []}
         edge_set = {(source, pid1), (source, pid2)}
@@ -162,6 +164,40 @@ class RefStrongIdTests(unittest.TestCase):
         self.assertIsNone(pid)
         self.assertEqual(papers[p]["doi"], "10.1234/x", "should not overwrite existing DOI")
         self.assertEqual(len(papers), 1)
+
+    def test_arxiv_versions_stay_on_refs_and_share_one_paper(self):
+        papers = {}
+        refs = [_parse_reference(f"Paper arXiv:2401.12345v{version}") for version in (1, 2, 3)]
+
+        resolved = []
+        for ref, version in zip(refs, (1, 2, 3)):
+            pid, via = _get_or_create_paper_for_ref(papers, ref)
+            resolved.append(pid)
+            self.assertEqual(via, "arxiv")
+            self.assertEqual(ref["arxiv"], "2401.12345")
+            self.assertEqual(ref["arxiv_version"], f"v{version}")
+
+        self.assertEqual(resolved, ["arxiv:2401.12345"] * 3)
+        self.assertEqual(len(papers), 1)
+        self.assertEqual(papers["arxiv:2401.12345"]["arxiv"], "2401.12345")
+        self.assertNotIn("arxiv_version", papers["arxiv:2401.12345"])
+
+    def test_paper_version_migration_removes_only_legacy_paper_field(self):
+        papers = {
+            "arxiv:2401.12345": {
+                "id": "arxiv:2401.12345",
+                "arxiv": "2401.12345",
+                "arxiv_version": "v2",
+                "title": "Keep this",
+                "documents": ["a" * 64],
+            }
+        }
+
+        self.assertTrue(_migrate_papers_cache(papers))
+        self.assertNotIn("arxiv_version", papers["arxiv:2401.12345"])
+        self.assertEqual(papers["arxiv:2401.12345"]["title"], "Keep this")
+        self.assertEqual(papers["arxiv:2401.12345"]["documents"], ["a" * 64])
+        self.assertFalse(_migrate_papers_cache(papers))
 
 
 if __name__ == "__main__":

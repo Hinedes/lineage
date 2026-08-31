@@ -152,6 +152,16 @@ def _migrate_refs_cache(refs_cache: dict) -> bool:
     return mutated
 
 
+def _migrate_papers_cache(papers: dict) -> bool:
+    """Remove legacy paper-level arXiv versions; refs/documents keep their versions."""
+    mutated = False
+    for paper in papers.values():
+        if isinstance(paper, dict) and "arxiv_version" in paper:
+            del paper["arxiv_version"]
+            mutated = True
+    return mutated
+
+
 def _canonical_strong_id(ref: dict) -> tuple[str | None, str | None]:
     """Return (paper_id, via) for strong IDs only (doi/arxiv), else (None, None). — legacy, use _find_strong_matches."""
     doi = ref.get("doi")
@@ -189,9 +199,7 @@ def _get_or_create_paper_for_ref(papers: dict, ref: dict) -> tuple[str | None, s
     """
     doi_norm = normalize_doi(ref.get("doi")) if ref.get("doi") else None
     arxiv_raw = ref.get("arxiv")
-    arxiv_base, arxiv_version_norm = normalize_arxiv(arxiv_raw) if arxiv_raw else (None, None)
-    # version from ref evidence (explicit) takes precedence for storage, but paper identity is base only
-    arxiv_version = ref.get("arxiv_version") or arxiv_version_norm
+    arxiv_base, _ = normalize_arxiv(arxiv_raw) if arxiv_raw else (None, None)
 
     if not doi_norm and not arxiv_base:
         return None, None
@@ -210,11 +218,6 @@ def _get_or_create_paper_for_ref(papers: dict, ref: dict) -> tuple[str | None, s
             paper["doi"] = doi_norm
         if arxiv_base and not paper.get("arxiv"):
             paper["arxiv"] = arxiv_base
-            if arxiv_version and not paper.get("arxiv_version"):
-                paper["arxiv_version"] = arxiv_version
-        elif arxiv_base and arxiv_version and not paper.get("arxiv_version"):
-            # same arXiv base, missing version -> enrich
-            paper["arxiv_version"] = arxiv_version
         return pid, via
     if len(matches) > 1:
         # both identifiers point to different existing papers -> identity conflict, don't silently choose
@@ -233,12 +236,11 @@ def _get_or_create_paper_for_ref(papers: dict, ref: dict) -> tuple[str | None, s
     # check if canonical id already exists (should not, since matches==0, but be safe)
     if paper_id in papers:
         return paper_id, via
-    evidence = make_evidence(title="", authors=[], doi=doi_norm, arxiv=arxiv_base, arxiv_version=arxiv_version)
+    evidence = make_evidence(title="", authors=[], doi=doi_norm, arxiv=arxiv_base)
     papers[paper_id] = {
         "id": paper_id,
         "doi": evidence.get("doi"),
         "arxiv": evidence.get("arxiv"),
-        "arxiv_version": evidence.get("arxiv_version"),
         "title": "",
         "title_norm": "",
         "authors": [],
@@ -445,6 +447,7 @@ def main(argv=None):
     refs_cache = load_json(REFS, {})  # sha256 -> {mode, refs: [{index, raw}]}
     # backward compat: migrate old string refs to object refs
     refs_migrated = _migrate_refs_cache(refs_cache)
+    papers_migrated = _migrate_papers_cache(papers)
     graph.setdefault("nodes", [])
     graph.setdefault("edges", [])
 
@@ -663,16 +666,9 @@ def main(argv=None):
     new_nodes = sorted(papers.values(), key=lambda p: p["id"])
     new_edges = sorted([{"from": s, "to": t} for s, t in edge_set], key=lambda e: (e["from"], e["to"]))
     graph_dirty = False
-    if len(graph.get("nodes", [])) != len(new_nodes) or any(n["id"] not in {x["id"] for x in new_nodes} for n in graph.get("nodes", [])):
+    if graph.get("nodes", []) != new_nodes:
         graph["nodes"] = new_nodes
         graph_dirty = True
-    else:
-        # check if nodes content differs (e.g., new papers added)
-        existing_ids = {n["id"] for n in graph.get("nodes", [])}
-        new_ids = {n["id"] for n in new_nodes}
-        if existing_ids != new_ids:
-            graph["nodes"] = new_nodes
-            graph_dirty = True
     # edges
     existing_edges_set = {(e.get("from") or e.get("source"), e.get("to") or e.get("target")) for e in graph.get("edges", [])}
     if existing_edges_set != edge_set:
@@ -687,7 +683,7 @@ def main(argv=None):
     manifest_dirty = new_cnt > 0 or reconcile_cnt > 0
     if manifest_dirty:
         save_json(MANIFEST, manifest)
-    papers_dirty = len(papers) != papers_before or refs_resolve_dirty
+    papers_dirty = papers_migrated or len(papers) != papers_before or refs_resolve_dirty
     if papers_dirty:
         save_json(PAPERS, papers)
     if graph_dirty:
