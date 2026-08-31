@@ -3,17 +3,18 @@
 PDF is source of truth. No LLM, no S2.
 
   python ingest.py              # refresh docs/ (default)
-  python ingest.py --refresh    # same
   python ingest.py docs/        # explicit dir
-  python ingest.py --clear      # wipe manifest/graph (re-ingest next run)
+  python ingest.py --clear      # wipe local stores
 
-ID: lazy-correct hybrid
-  - dup check = sha256(pdf_bytes)  => re-ingest same PDF never duplicates
-  - arxiv/version = filename  r\"(\\d{4}\\.\\d{4,5})(v\\d+)\"  (33/35 corpus)  else None
-  - title       = file: metadata.title or first substantive line of p0 text
-  - year/date   = file: arxiv date from filename if present else year in p0
+Identity:
+  - document = sha256(pdf bytes)
+  - paper reconciliation = DOI -> arXiv base ID -> normalized title + authors
+  - arXiv version is document metadata, not paper identity
 
-Store: .cache/lineage2.json  (ignored by .gitignore)  +  .cache/graph.json
+Stores:
+  .cache/lineage2.json  documents
+  .cache/papers.json    reconciled papers
+  .cache/graph.json     current graph skeleton
 """
 import hashlib
 import json
@@ -24,19 +25,25 @@ from pathlib import Path
 from pypdf import PdfReader
 
 import bib_extract
+from reconcile import (
+    extract_arxiv,
+    extract_authors_from_front_page,
+    extract_doi,
+    make_evidence,
+    normalize_arxiv,
+    reconcile_document,
+)
 from split_refs import split_bib
 
-# ponytail: stdlib only, pypdf already required by bib_extract.py
-
-ARXIV_FN = re.compile(r"(\d{4}\.\d{4,5})(v\d+)", re.I)
+ARXIV_FN = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?", re.I)
 ARXIV_DATE = re.compile(r"(\d{2})(\d{2})\.\d+")
-YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
-DOI_RE = re.compile(r"10\.\d{4,}/[^\s,;]+")
-ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?", re.I)
+YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 
 CACHE_DIR = Path(".cache")
 MANIFEST = CACHE_DIR / "lineage2.json"
+PAPERS = CACHE_DIR / "papers.json"
 GRAPH = CACHE_DIR / "graph.json"
+
 
 def sha256_file(p: Path) -> str:
     h = hashlib.sha256()
@@ -45,120 +52,167 @@ def sha256_file(p: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-def identify_pdf(pdf: Path) -> dict:
-    """Hybrid: filename for arxiv/version, file for title/year."""
-    name = pdf.name
-    fn_m = ARXIV_FN.search(name)
-    arxiv = fn_m.group(0) if fn_m else None
-    version = fn_m.group(2) if fn_m else None
-    # date from arxiv YYMM
-    arxiv_date = None
-    if fn_m:
-        d = ARXIV_DATE.search(fn_m.group(1))
-        if d:
-            yy, mm = int(d.group(1)), int(d.group(2))
-            yyyy = 2000 + yy if yy < 80 else 1900 + yy
-            arxiv_date = f"{yyyy:04d}-{mm:02d}"
 
-    # file: title + year fallback
+def _arxiv_date(base: str | None) -> str | None:
+    if not base:
+        return None
+    m = ARXIV_DATE.search(base)
+    if not m:
+        return None
+    yy, mm = int(m.group(1)), int(m.group(2))
+    yyyy = 2000 + yy if yy < 80 else 1900 + yy
+    return f"{yyyy:04d}-{mm:02d}"
+
+
+def identify_pdf(pdf: Path) -> dict:
+    """Read paper identity evidence from the PDF, using filename only as fallback."""
+    name = pdf.name
     title = ""
     year = None
+    doi = None
+    authors = []
+    arxiv = None
+    version = None
+    first_page = ""
+
     try:
-        r = PdfReader(str(pdf))
-        meta_title = (r.metadata.title or "").strip() if r.metadata else ""
+        reader = PdfReader(str(pdf))
+        if reader.pages:
+            first_page = reader.pages[0].extract_text() or ""
+
+        # Prefer the explicit arXiv marker inside the PDF text. pypdf also
+        # extracts the rotated margin marker used by arXiv PDFs.
+        arxiv, version = extract_arxiv(first_page)
+
+        meta = reader.metadata
+        meta_title = (meta.title or "").strip() if meta else ""
+        meta_author = (meta.author or "").strip() if meta else ""
+
         if meta_title and len(meta_title) >= 8 and "Microsoft Word" not in meta_title:
             title = meta_title
         else:
-            # first substantive lines of p0
-            txt = (r.pages[0].extract_text() or "") if r.pages else ""
-            for line in txt.splitlines():
+            for line in first_page.splitlines():
                 t = line.strip()
-                if len(t) >= 12 and not t.lower().startswith("arxiv:"):
-                    # skip headers like "Published as..."
-                    if len(t.split()) >= 3:
-                        title = t
-                        break
-            # fallback to p0 head collapsed
+                low = t.casefold()
+                if len(t) < 12 or low.startswith("arxiv:") or low.startswith("published as"):
+                    continue
+                if len(t.split()) >= 3:
+                    title = t
+                    break
             if not title:
-                txt = txt.replace("\n", " ").strip()
-                title = txt[:120].split("  ")[0].strip() if txt else name
+                collapsed = first_page.replace("\n", " ").strip()
+                title = collapsed[:220].split("  ")[0].strip() if collapsed else name
 
-        # year fallback if no arxiv date
-        if not arxiv_date:
-            txt = ""
-            if r.pages:
-                txt = (r.pages[0].extract_text() or "")[:3000]
-            m = YEAR_RE.search(txt)
+        if meta_author:
+            authors = [meta_author]
+        else:
+            authors = extract_authors_from_front_page(first_page, title)
+
+        doi = extract_doi(first_page)
+
+        if not arxiv:
+            fn = ARXIV_FN.search(name)
+            if fn:
+                arxiv, parsed_version = normalize_arxiv(fn.group(0))
+                version = version or parsed_version
+
+        if not arxiv:
+            m = YEAR_RE.search(first_page[:3000])
             if m:
                 year = m.group(0)
     except Exception:
         if not title:
             title = name
 
-    return {"filename": name, "arxiv": arxiv, "version": version, "arxiv_date": arxiv_date, "year": year, "title": title[:220]}
+    return {
+        "filename": name,
+        "arxiv": arxiv,
+        "version": version,
+        "arxiv_date": _arxiv_date(arxiv),
+        "doi": doi,
+        "year": year,
+        "title": title[:220],
+        "authors": authors,
+    }
 
-def load_manifest() -> dict:
-    if MANIFEST.exists():
+
+def load_json(path: Path, default):
+    if path.exists():
         try:
-            return json.loads(MANIFEST.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            return {}
-    return {}
+            return default
+    return default
 
-def save_manifest(m: dict):
+
+def save_json(path: Path, value) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    MANIFEST.write_text(json.dumps(m, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
 
-def load_graph() -> dict:
-    if GRAPH.exists():
-        try:
-            return json.loads(GRAPH.read_text(encoding="utf-8"))
-        except Exception:
-            return {"nodes": [], "edges": []}
-    return {"nodes": [], "edges": []}
-
-def save_graph(g: dict):
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    GRAPH.write_text(json.dumps(g, indent=2, ensure_ascii=False), encoding="utf-8")
 
 def ingest_one(pdf: Path, h: str, ident: dict) -> dict:
-    """Read → extract → split → minimal resolveattempt → return node record."""
-    # 1. extract bibliography (in-memory, don't write .references.txt to docs)
+    """Read -> extract bibliography -> split. Reference resolution is intentionally absent."""
     try:
         reader = PdfReader(str(pdf))
         text = "\n".join(page.extract_text() or "" for page in reader.pages)
     except Exception as e:
-        return {"id": h[:16], "sha256": h, **ident, "error": f"pdf_read:{e}", "references": 0, "mode": "fail"}
+        return {
+            "id": h[:16],
+            "sha256": h,
+            **ident,
+            "error": f"pdf_read:{e}",
+            "references": 0,
+            "mode": "fail",
+        }
 
     m = bib_extract.HEADING.search(text)
     if not m:
-        return {"id": h[:16], "sha256": h, **ident, "error": "no_references", "references": 0, "mode": "fail"}
-    tail = text[m.start():]
-    s = bib_extract.STOP.search(tail)
-    bib = tail[:s.start()] if s else tail
+        return {
+            "id": h[:16],
+            "sha256": h,
+            **ident,
+            "error": "no_references",
+            "references": 0,
+            "mode": "fail",
+        }
 
+    tail = text[m.start():]
+    stop = bib_extract.STOP.search(tail)
+    bib = tail[:stop.start()] if stop else tail
     mode, refs = split_bib(bib)
 
-    # minimal ID of cited refs: extract first doi/arxiv if present, else leave unresolved
-    resolved = 0
-    for r in refs:
-        if DOI_RE.search(r) or ARXIV_ID_RE.search(r):
-            resolved += 1
+    return {
+        "id": h[:16],
+        "sha256": h,
+        **ident,
+        "references": len(refs),
+        "mode": mode,
+        "chars": len(bib),
+    }
 
-    return {"id": h[:16], "sha256": h, **ident, "references": len(refs), "mode": mode, "resolved_hint": resolved, "chars": len(bib)}
+
+def reconcile_pdf(papers: dict, ident: dict, h: str) -> tuple[str, str]:
+    evidence = make_evidence(
+        title=ident.get("title", ""),
+        authors=ident.get("authors", []),
+        doi=ident.get("doi"),
+        arxiv=ident.get("arxiv"),
+        arxiv_version=ident.get("version"),
+    )
+    return reconcile_document(papers, evidence, h)
+
 
 def main(argv=None):
     argv = argv or sys.argv[1:]
+
     if "--clear" in argv:
-        for p in [MANIFEST, GRAPH]:
+        for p in (MANIFEST, PAPERS, GRAPH):
             if p.exists():
                 p.unlink()
                 print(f"cleared {p}")
-        # also clear --clear implies no refresh run; allow --clear --refresh to continue
         if len(argv) == 1:
             return 0
 
-    # dir = first non-flag arg else docs/
     dirs = [a for a in argv if not a.startswith("-")]
     pdf_dir = Path(dirs[0]) if dirs else Path("docs")
     if not pdf_dir.exists():
@@ -170,44 +224,105 @@ def main(argv=None):
         print(f"no PDFs in {pdf_dir}")
         return 0
 
-    manifest = load_manifest()
-    graph = load_graph()
-    # index graph nodes by sha256 for dedup
-    seen_hashes = set(manifest.keys())
-    graph_ids = {n["sha256"] for n in graph.get("nodes", []) if "sha256" in n}
+    manifest = load_json(MANIFEST, {})
+    papers = load_json(PAPERS, {})
+    graph = load_json(GRAPH, {"nodes": [], "edges": []})
+    graph.setdefault("nodes", [])
+    graph.setdefault("edges", [])
 
-    new_cnt = skip_cnt = 0
-    # ponytail: track hashes seen in this run too, so duplicate file (1) is skipped intra-batch
+    graph_by_hash = {
+        node["sha256"]: node
+        for node in graph["nodes"]
+        if isinstance(node, dict) and node.get("sha256")
+    }
+
+    new_cnt = skip_cnt = reconcile_cnt = 0
     seen_this_run = set()
+
     for pdf in pdfs:
         h = sha256_file(pdf)
-        if h in seen_hashes or h in graph_ids or h in seen_this_run:
-            print(f"skip  {pdf.name}  {h[:8]}  already integrated")
+        if h in seen_this_run:
+            print(f"skip  {pdf.name}  {h[:8]}  duplicate bytes in this batch")
             skip_cnt += 1
             continue
         seen_this_run.add(h)
+
+        existing = manifest.get(h)
+        needs_reconciliation = not existing or not existing.get("paper_id")
+
+        if existing and not needs_reconciliation:
+            print(
+                f"skip  {pdf.name}  {h[:8]}  already integrated"
+                f"  paper={existing['paper_id']}"
+            )
+            skip_cnt += 1
+            continue
+
         ident = identify_pdf(pdf)
+        paper_id, recon_status = reconcile_pdf(papers, ident, h)
+
+        if existing:
+            # Migration path for caches created before paper reconciliation existed.
+            existing.update({
+                **ident,
+                "paper_id": paper_id,
+                "reconciliation": recon_status,
+            })
+            node = graph_by_hash.get(h)
+            if node:
+                node.update({
+                    "paper_id": paper_id,
+                    "reconciliation": recon_status,
+                    "doi": ident.get("doi"),
+                    "arxiv": ident.get("arxiv"),
+                    "version": ident.get("version"),
+                    "authors": ident.get("authors", []),
+                })
+            print(
+                f"recon {pdf.name}  {h[:8]}  paper={paper_id}"
+                f"  via={recon_status}"
+            )
+            reconcile_cnt += 1
+            continue
+
         rec = ingest_one(pdf, h, ident)
-        # store
-        manifest[h] = {**ident, "sha256": h, "id": h[:16], "references": rec.get("references", 0), "mode": rec.get("mode")}
-        graph.setdefault("nodes", []).append(rec)
-        # edges: host -> cited (stub: one edge per reference that has an id hint)
-        # for now, edges are implicit via reference count; real cited-node resolution is next step
-        # we record a summary edge count
-        graph.setdefault("edges", [])
-        # ponytail: no per-reference node creation yet; unresolved refs stay as count, not guessed
+        rec["paper_id"] = paper_id
+        rec["reconciliation"] = recon_status
+
+        manifest[h] = {
+            **ident,
+            "sha256": h,
+            "id": h[:16],
+            "paper_id": paper_id,
+            "reconciliation": recon_status,
+            "references": rec.get("references", 0),
+            "mode": rec.get("mode"),
+        }
+        graph["nodes"].append(rec)
+        graph_by_hash[h] = rec
 
         extra = f" | {rec.get('error')}" if rec.get("error") else ""
-        print(f"new   {pdf.name}  {h[:8]}  arxiv={ident['arxiv'] or '-':15}  refs={rec.get('references',0):3}  mode={rec.get('mode'):7}  title={ident['title'][:55]!r}{extra}")
+        print(
+            f"new   {pdf.name}  {h[:8]}  paper={paper_id}"
+            f"  via={recon_status}  refs={rec.get('references', 0):3}"
+            f"  mode={rec.get('mode'):7}  title={ident['title'][:48]!r}{extra}"
+        )
         new_cnt += 1
 
-    save_manifest(manifest)
-    save_graph(graph)
-    print(f"\ndone: scanned={len(pdfs)} new={new_cnt} skip={skip_cnt}  manifest={MANIFEST}  graph={GRAPH}")
-    # also show graph summary
-    total_refs = sum(n.get("references", 0) for n in graph.get("nodes", []))
-    print(f"graph: nodes={len(graph.get('nodes',[]))}  total_references={total_refs}")
+    save_json(MANIFEST, manifest)
+    save_json(PAPERS, papers)
+    save_json(GRAPH, graph)
+
+    print(
+        f"\ndone: scanned={len(pdfs)} new={new_cnt} reconciled={reconcile_cnt}"
+        f" skip={skip_cnt}"
+    )
+    print(
+        f"identity: documents={len(manifest)} papers={len(papers)}"
+        f"  stores={MANIFEST}, {PAPERS}"
+    )
     return 0
+
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
