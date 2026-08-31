@@ -266,6 +266,43 @@ class RefEvidenceTests(unittest.TestCase):
         self.assertNotIn("http", with_url["title"])
         self.assertNotIn("title", venue_only)
 
+    def test_truncated_title_is_not_emitted(self):
+        ref = _parse_reference("Lisa Torrey and Jude Shavlik. 2010. Transfer learn-")
+
+        self.assertNotIn("title", ref)
+        self.assertEqual(ref["authors"], ["Lisa Torrey", "Jude Shavlik"])
+        self.assertEqual(ref["year"], "2010")
+
+    def test_glued_final_author_is_not_treated_as_title(self):
+        expected_authors = ["Fang, J.", "Deng, X.", "Chen, H.", "Zhang, N"]
+        for separator in (";andZhang, N.", ";and Zhang, N."):
+            raw = f"Fang, J.; Deng, X.; Chen, H.{separator} 2026. LightMem: Lightweight and Efficient Memory-"
+            with self.subTest(separator=separator):
+                ref = _parse_reference(raw)
+                self.assertNotIn("title", ref)
+                self.assertEqual(ref["authors"], expected_authors)
+                self.assertNotIn("andZhang", " ".join(ref["authors"]))
+
+    def test_no_space_venue_tail_stops_at_title(self):
+        cases = (
+            (
+                "Navindra Persaud and Alan Cowey. Blindsight is unlike normal conscious vision: evidence from an exclusion task.Consciousness and cognition, 17(3):1050–1055, 2008.",
+                "Blindsight is unlike normal conscious vision: evidence from an exclusion task",
+            ),
+            (
+                "Y. LeCun, B. Boser, J. S. Denker, D. Henderson, R. E. Howard, W. Hubbard, and L. D. Jackel. Backpropagation applied to handwritten zip code recognition.Neural Computation, 1(4):541–551, 1989.",
+                "Backpropagation applied to handwritten zip code recognition",
+            ),
+            (
+                "Stanislas Dehaene and Jean-Pierre Changeux. Experimental and theoretical approaches to conscious processing.Neuron, 70(2):200–227, 2011.",
+                "Experimental and theoretical approaches to conscious processing",
+            ),
+        )
+        for raw, expected_title in cases:
+            with self.subTest(raw=raw):
+                ref = _parse_reference(raw)
+                self.assertEqual(ref["title"], expected_title)
+
     def test_enrichment_adds_evidence_without_overwriting_resolution(self):
         raw = "John Smith and Alice Doe. A title: GPT-4, R&D, 3D. In Proceedings of Tests, 2021."
         ref = {

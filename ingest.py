@@ -69,6 +69,19 @@ _ORGANIZATION_MARKERS = {
     "research", "society", "technology", "technologies", "university",
 }
 _TITLE_ABBREVIATION_RE = re.compile(r"\b(?:e\.g|i\.e|etc|vs|fig|no|vol|pp|dr|mr|ms|prof)\.$", re.I)
+_TITLE_WRAP_RE = re.compile(r"[-\u2010\u2011\u2012\u2013\u2014]\s*$")
+_GLUED_AUTHOR_RE = re.compile(
+    r"(^|[;,]\s*)and(?=\s*[A-Z][^,;]{1,50},\s*[A-Z](?:\.|\s|$))", re.I
+)
+_VENUE_PREFIX = (
+    r"(?:(?:the\s+)?journal(?:\s+of(?:\s+[A-Za-z][\w-]*){0,8})?|"
+    r"(?:the\s+)?proceedings(?:\s+of(?:\s+[A-Za-z][\w-]*){0,8})?|"
+    r"ima\s+journal|neural\s+computation|consciousness\s+and\s+cognition|"
+    r"(?:the\s+)?annals\s+of\s+statistics|neuron|arxiv(?:\s+preprint)?|corr|"
+    r"siam|ieee|acm|transactions|international\s+conference|advances\s+in|"
+    r"american\s+mathematical\s+society|springer|nature|neurips|icml|iclr|cvpr|"
+    r"acl|emnlp|distill|dokl|commun|sn)"
+)
 
 CACHE_DIR = Path(".cache")
 MANIFEST = CACHE_DIR / "lineage2.json"
@@ -116,6 +129,7 @@ def _author_parts(text: str) -> tuple[list[str], bool]:
     s = re.sub(r"\s+", " ", text or "").strip(" ,;")
     incomplete = bool(re.search(r"\bet\s+al\.?\b", s, re.I))
     s = re.sub(r"(?:,?\s*(?:and\s+)?et\s+al\.?)\s*$", "", s, flags=re.I).strip(" ,;")
+    s = _GLUED_AUTHOR_RE.sub(r"\1", s)
     s = re.sub(r"\s+(?:and|&)\s+", ", ", s, flags=re.I)
     chunks = [p.strip() for p in re.split(r"\s*;\s*", s) if p.strip()]
     pieces = []
@@ -196,6 +210,14 @@ def _clean_title(text: str) -> str:
     return title.strip(" ,;")
 
 
+def _author_evidence(authors: list[str], complete: bool) -> dict:
+    return {
+        "authors": authors,
+        "authors_norm": parse_author_list(authors),
+        "authors_complete": complete,
+    }
+
+
 def _is_organization_prefix(text: str) -> bool:
     tokens = _NAME_TOKEN_RE.findall(text or "")
     if len(tokens) == 1:
@@ -228,10 +250,7 @@ def _title_from_rest(text: str) -> str | None:
         return None
     rest = re.split(r",\s+volume\s+\d+\s+of(?=[A-Z])", rest, maxsplit=1, flags=re.I)[0]
     inline_venue = re.search(
-        r"[.!?](?:\s*)(?=(?:(?:the\s+)?journal|(?:the\s+)?proceedings|ima\s+journal|"
-        r"arxiv(?:\s+preprint)?|corr|siam|ieee|acm|transactions|international conference|"
-        r"advances in|american mathematical society|springer|nature|neurips|icml|iclr|cvpr|acl|"
-        r"emnlp|distill|dokl|commun|sn)\b)",
+        rf"[.!?]\s*(?={_VENUE_PREFIX}\b[^.!?]{{0,180}}(?:,\s*(?:\d|\(|pages?\b|pp\.?\b)|\b(?:19|20)\d{{2}}\b))",
         rest,
         re.I,
     )
@@ -244,13 +263,15 @@ def _title_from_rest(text: str) -> str | None:
         if match.group(0) == "." and _TITLE_ABBREVIATION_RE.search(candidate):
             continue
         title = _clean_title(candidate)
+        if _TITLE_WRAP_RE.search(title):
+            return None
         if len(title) >= 4 and re.search(r"[A-Za-z]", title):
             return title
     url = re.search(r"\s+(?=(?:https?://|www\.|(?:arxiv|doi)\s*:))", rest, re.I)
     if url:
         rest = rest[:url.start()]
     title = _clean_title(rest)
-    if len(title) < 4 or len(title) > 220 or not re.search(r"[A-Za-z]", title):
+    if _TITLE_WRAP_RE.search(title) or len(title) < 4 or len(title) > 220 or not re.search(r"[A-Za-z]", title):
         return None
     if re.search(r"(?:https?://|www\.|(?:arxiv|doi)\s*:|arxiv\s+preprint)", title, re.I):
         return None
@@ -261,6 +282,8 @@ def _starts_author_continuation(rest: str) -> bool:
     if re.match(r"et\s+al\.?\b", rest, re.I):
         return True
     if re.match(r"(?:and|&)\s+", rest, re.I):
+        return True
+    if _GLUED_AUTHOR_RE.match(rest):
         return True
     if re.match(r"^[A-Z](?:\.-?[A-Z])?\.?\s*,", rest):
         return True
@@ -300,13 +323,7 @@ def _title_author_evidence(raw: str) -> dict:
         authors, complete = _parse_author_evidence(text[:quote.start()].strip(" ,.;"))
         title = _clean_title(quote.group(1))
         if authors and len(title) >= 4:
-            return {
-                "title": title,
-                "title_norm": normalize_title(title),
-                "authors": authors,
-                "authors_norm": parse_author_list(authors),
-                "authors_complete": complete,
-            }
+            return {"title": title, "title_norm": normalize_title(title), **_author_evidence(authors, complete)}
 
     prefix = _PREFIX_YEAR_RE.match(text)
     if prefix and len(prefix.group("authors")) <= 320:
@@ -315,15 +332,13 @@ def _title_author_evidence(raw: str) -> dict:
         if title:
             result = {"title": title, "title_norm": normalize_title(title)}
             if prefix_authors:
-                result.update(
-                    authors=prefix_authors,
-                    authors_norm=parse_author_list(prefix_authors),
-                    authors_complete=complete,
-                )
+                result.update(_author_evidence(prefix_authors, complete))
             elif _is_organization_prefix(prefix.group("authors")):
                 return result
             if prefix_authors:
                 return result
+        elif prefix_authors:
+            return _author_evidence(prefix_authors, complete)
 
     for boundary in re.finditer(r"\.", text):
         if (boundary.start() and text[boundary.start() - 1] == "-") or text[boundary.end():].startswith("-"):
@@ -336,14 +351,8 @@ def _title_author_evidence(raw: str) -> dict:
             continue
         title = _title_from_rest(rest)
         if not title:
-            return {}
-        return {
-            "title": title,
-            "title_norm": normalize_title(title),
-            "authors": authors,
-            "authors_norm": parse_author_list(authors),
-            "authors_complete": complete,
-        }
+            return _author_evidence(authors, complete)
+        return {"title": title, "title_norm": normalize_title(title), **_author_evidence(authors, complete)}
     return {}
 
 
