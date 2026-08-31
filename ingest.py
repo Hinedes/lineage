@@ -82,6 +82,11 @@ _VENUE_PREFIX = (
     r"american\s+mathematical\s+society|springer|nature|neurips|icml|iclr|cvpr|"
     r"acl|emnlp|distill|dokl|commun|sn)"
 )
+REF_EVIDENCE_VERSION = 2
+DERIVED_EVIDENCE_FIELDS = (
+    "doi", "arxiv", "arxiv_version", "year", "title", "title_norm", "authors", "authors_norm",
+    "authors_complete",
+)
 
 CACHE_DIR = Path(".cache")
 MANIFEST = CACHE_DIR / "lineage2.json"
@@ -383,16 +388,21 @@ def _parse_reference(raw: str) -> dict:
     return out
 
 
+def _new_ref(index: int, raw: str) -> dict:
+    return {"index": index, "raw": raw, **_parse_reference(raw), "evidence_version": REF_EVIDENCE_VERSION}
+
+
 def _enrich_ref_with_evidence(ref: dict) -> bool:
-    """Add deterministic evidence fields to a {index, raw} ref if missing. Returns True if mutated."""
+    """Refresh derived evidence while preserving source and resolution fields."""
+    if ref.get("evidence_version") == REF_EVIDENCE_VERSION:
+        return False
     raw = ref.get("raw", "")
+    for field in DERIVED_EVIDENCE_FIELDS:
+        ref.pop(field, None)
     parsed = _parse_reference(raw)
-    mutated = False
-    for k, v in parsed.items():
-        if k not in ref:
-            ref[k] = v
-            mutated = True
-    return mutated
+    ref.update(parsed)
+    ref["evidence_version"] = REF_EVIDENCE_VERSION
+    return True
 
 
 def _migrate_refs_cache(refs_cache: dict) -> bool:
@@ -403,20 +413,10 @@ def _migrate_refs_cache(refs_cache: dict) -> bool:
         if not refs:
             continue
         if isinstance(refs[0], str):
-            entry["refs"] = [{"index": i, "raw": s, **_parse_reference(s)} for i, s in enumerate(refs)]
+            entry["refs"] = [_new_ref(i, s) for i, s in enumerate(refs)]
             mutated = True
         elif isinstance(refs[0], dict):
-            # repair index only, preserve every other field (paper_id, status, etc.)
-            needs_fix = False
-            for i, r in enumerate(refs):
-                if r.get("index") != i or "raw" not in r:
-                    needs_fix = True
-                    break
-            if needs_fix:
-                for i, r in enumerate(refs):
-                    r["index"] = i
-                mutated = True
-            # enrich old {index, raw} refs with deterministic evidence if missing
+            # preserve index/raw and every resolution field while refreshing parser evidence
             for r in refs:
                 if _enrich_ref_with_evidence(r):
                     mutated = True
@@ -750,7 +750,7 @@ def main(argv=None):
                 rec_tmp = ingest_one(pdf, h, ident_tmp)
                 refs_cache[h] = {
                     "mode": rec_tmp.get("mode"),
-                    "refs": [{"index": i, "raw": s, **_parse_reference(s)} for i, s in enumerate(rec_tmp.get("refs", []))],
+                    "refs": [_new_ref(i, s) for i, s in enumerate(rec_tmp.get("refs", []))],
                 }
                 refs_written += 1
                 refs_dirty = True
@@ -798,7 +798,7 @@ def main(argv=None):
                 rec_tmp = ingest_one(pdf, h, ident)
                 refs_cache[h] = {
                     "mode": rec_tmp.get("mode"),
-                    "refs": [{"index": i, "raw": s, **_parse_reference(s)} for i, s in enumerate(rec_tmp.get("refs", []))],
+                    "refs": [_new_ref(i, s) for i, s in enumerate(rec_tmp.get("refs", []))],
                 }
                 refs_written += 1
                 refs_dirty = True
@@ -826,7 +826,7 @@ def main(argv=None):
         # cache the split refs as stable per-reference records (index + raw + deterministic evidence)
         refs_cache[h] = {
             "mode": rec.get("mode"),
-            "refs": [{"index": i, "raw": s, **_parse_reference(s)} for i, s in enumerate(rec.get("refs", []))],
+            "refs": [_new_ref(i, s) for i, s in enumerate(rec.get("refs", []))],
         }
         refs_written += 1
         refs_dirty = True

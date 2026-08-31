@@ -1,6 +1,13 @@
 import unittest
 
-from ingest import _enrich_ref_with_evidence, _get_or_create_paper_for_ref, _migrate_papers_cache, _parse_reference
+from ingest import (
+    REF_EVIDENCE_VERSION,
+    _enrich_ref_with_evidence,
+    _get_or_create_paper_for_ref,
+    _migrate_papers_cache,
+    _migrate_refs_cache,
+    _parse_reference,
+)
 from reconcile import make_evidence, reconcile_document
 
 
@@ -303,8 +310,8 @@ class RefEvidenceTests(unittest.TestCase):
                 ref = _parse_reference(raw)
                 self.assertEqual(ref["title"], expected_title)
 
-    def test_enrichment_adds_evidence_without_overwriting_resolution(self):
-        raw = "John Smith and Alice Doe. A title: GPT-4, R&D, 3D. In Proceedings of Tests, 2021."
+    def test_enrichment_refreshes_derived_evidence_without_overwriting_resolution(self):
+        raw = "John Smith and Alice Doe. A title: GPT-4, R&D, 3D. arXiv:2101.12345v2, 2021. doi:10.1234/parsed"
         ref = {
             "index": 7,
             "raw": raw,
@@ -319,13 +326,80 @@ class RefEvidenceTests(unittest.TestCase):
         self.assertTrue(_enrich_ref_with_evidence(ref))
         self.assertEqual(ref["raw"], raw)
         self.assertEqual(ref["index"], 7)
-        self.assertEqual(ref["doi"], "10.9999/existing")
-        self.assertEqual(ref["arxiv"], "9999.99999")
-        self.assertEqual(ref["arxiv_version"], "v9")
+        self.assertEqual(ref["doi"], "10.1234/parsed")
+        self.assertEqual(ref["arxiv"], "2101.12345")
+        self.assertEqual(ref["arxiv_version"], "v2")
         self.assertEqual(ref["paper_id"], "arxiv:2101.12345")
         self.assertEqual(ref["status"], "resolved")
         self.assertEqual(ref["resolved_via"], "arxiv")
+        self.assertEqual(ref["evidence_version"], REF_EVIDENCE_VERSION)
         self.assertFalse(_enrich_ref_with_evidence(ref))
+
+    def test_evidence_migration_removes_legacy_truncated_title(self):
+        raw = "Lisa Torrey and Jude Shavlik. 2010. Transfer learn-"
+        cache = {"doc": {"mode": "author", "refs": [{"index": 0, "raw": raw, "title": "Transfer learn-", "title_norm": "transfer learn-"}]}}
+
+        self.assertTrue(_migrate_refs_cache(cache))
+        ref = cache["doc"]["refs"][0]
+        self.assertNotIn("title", ref)
+        self.assertNotIn("title_norm", ref)
+        self.assertEqual(ref["authors"], ["Lisa Torrey", "Jude Shavlik"])
+        self.assertEqual(ref["year"], "2010")
+        self.assertEqual(ref["evidence_version"], REF_EVIDENCE_VERSION)
+        self.assertFalse(_migrate_refs_cache(cache))
+
+    def test_evidence_migration_reparses_glued_final_author(self):
+        raw = "Fang, J.; Deng, X.; Chen, H.;andZhang, N. 2026. LightMem: Lightweight and Efficient Memory-"
+        cache = {
+            "doc": {
+                "mode": "author",
+                "refs": [{"index": 0, "raw": raw, "title": "andZhang, N", "title_norm": "andzhang n"}],
+            }
+        }
+
+        self.assertTrue(_migrate_refs_cache(cache))
+        ref = cache["doc"]["refs"][0]
+        self.assertNotIn("title", ref)
+        self.assertNotIn("title_norm", ref)
+        self.assertEqual(ref["authors"][-1], "Zhang, N")
+        self.assertEqual(ref["authors"][:3], ["Fang, J.", "Deng, X.", "Chen, H."])
+
+    def test_evidence_migration_replaces_legacy_venue_leak(self):
+        raw = "Navindra Persaud and Alan Cowey. Blindsight is unlike normal conscious vision: evidence from an exclusion task.Consciousness and cognition, 17(3):1050–1055, 2008."
+        cache = {
+            "doc": {
+                "mode": "bracket",
+                "refs": [{
+                    "index": 3,
+                    "raw": raw,
+                    "title": "Blindsight is unlike normal conscious vision: evidence from an exclusion task.Consciousness and cognition, 17(3):1050–1055",
+                    "title_norm": "stale",
+                }],
+            }
+        }
+
+        self.assertTrue(_migrate_refs_cache(cache))
+        ref = cache["doc"]["refs"][0]
+        self.assertEqual(ref["index"], 3)
+        self.assertEqual(ref["title"], "Blindsight is unlike normal conscious vision: evidence from an exclusion task")
+        self.assertEqual(ref["title_norm"], "blindsight is unlike normal conscious vision evidence from an exclusion task")
+
+    def test_evidence_migration_preserves_stable_reference_fields(self):
+        raw = "John Smith and Alice Doe. A title. 2021."
+        stable = {
+            "index": 7,
+            "raw": raw,
+            "paper_id": "arxiv:2101.12345",
+            "status": "resolved",
+            "resolved_via": "arxiv",
+            "resolution_note": "keep",
+        }
+        cache = {"doc": {"mode": "author", "refs": [{**stable, "title": "stale", "title_norm": "stale"}]}}
+
+        self.assertTrue(_migrate_refs_cache(cache))
+        ref = cache["doc"]["refs"][0]
+        self.assertEqual({key: ref[key] for key in stable}, stable)
+        self.assertNotEqual(ref["title"], "stale")
 
 
 if __name__ == "__main__":
