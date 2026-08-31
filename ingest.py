@@ -68,6 +68,21 @@ def _arxiv_date(base: str | None) -> str | None:
     return f"{yyyy:04d}-{mm:02d}"
 
 
+def _normalize_stamp_date(s: str | None) -> str | None:
+    # "1 Jul 2022" -> "2022-07-01", " 1 Jul 2022 " tolerant; returns None on failure
+    if not s:
+        return None
+    import datetime
+    s = s.strip()
+    for fmt in ("%d %b %Y", "%d %B %Y"):
+        try:
+            dt = datetime.datetime.strptime(s, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
 def identify_pdf(pdf: Path) -> dict:
     """Read paper identity evidence from the PDF, using filename only as fallback."""
     name = pdf.name
@@ -137,11 +152,15 @@ def identify_pdf(pdf: Path) -> dict:
         if not title:
             title = name
 
+    # normalize stamp date to ISO; keep ID-derived month separate to avoid mixed schema
+    stamp_iso = _normalize_stamp_date(stamp_date)
+    arxiv_id_month = _arxiv_date(arxiv)
     out = {
         "filename": name,
         "arxiv": arxiv,
         "version": version,
-        "arxiv_date": stamp_date or _arxiv_date(arxiv),
+        "arxiv_date": stamp_iso,  # ISO 2022-07-01 from stamp if present, else None
+        "arxiv_id_month": arxiv_id_month,  # 2022-03 from ID, always YYYY-MM
         "doi": doi,
         "year": year,
         "title": title[:220],
@@ -151,6 +170,9 @@ def identify_pdf(pdf: Path) -> dict:
         out["arxiv_stamp"] = arxiv_stamp
     if arxiv_category:
         out["arxiv_category"] = arxiv_category
+    # keep raw stamp for debugging if needed
+    if stamp_date and not stamp_iso:
+        out["arxiv_stamp_raw"] = stamp_date
     return out
 
 
