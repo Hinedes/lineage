@@ -16,6 +16,7 @@ Stores:
   .cache/lineage2.json  documents
   .cache/papers.json    reconciled papers
   .cache/graph.json     current graph skeleton
+  .cache/refs.json      per-document split references (from split_bib, not thrown away)
 """
 import hashlib
 import json
@@ -47,6 +48,7 @@ CACHE_DIR = Path(".cache")
 MANIFEST = CACHE_DIR / "lineage2.json"
 PAPERS = CACHE_DIR / "papers.json"
 GRAPH = CACHE_DIR / "graph.json"
+REFS = CACHE_DIR / "refs.json"  # per-document split references (from split_bib)
 
 
 def sha256_file(p: Path) -> str:
@@ -191,7 +193,7 @@ def save_json(path: Path, value) -> None:
 
 
 def ingest_one(pdf: Path, h: str, ident: dict) -> dict:
-    """Read -> extract bibliography -> split. Reference resolution is intentionally absent."""
+    """Read -> extract bibliography -> split. Keeps the split refs for caching."""
     try:
         reader = PdfReader(str(pdf))
         text = "\n".join(page.extract_text() or "" for page in reader.pages)
@@ -203,6 +205,7 @@ def ingest_one(pdf: Path, h: str, ident: dict) -> dict:
             "error": f"pdf_read:{e}",
             "references": 0,
             "mode": "fail",
+            "refs": [],
         }
 
     m = bib_extract.HEADING.search(text)
@@ -214,6 +217,7 @@ def ingest_one(pdf: Path, h: str, ident: dict) -> dict:
             "error": "no_references",
             "references": 0,
             "mode": "fail",
+            "refs": [],
         }
 
     tail = text[m.start():]
@@ -228,6 +232,7 @@ def ingest_one(pdf: Path, h: str, ident: dict) -> dict:
         "references": len(refs),
         "mode": mode,
         "chars": len(bib),
+        "refs": refs,  # kept for cache, not thrown away
     }
 
 
@@ -245,7 +250,7 @@ def reconcile_pdf(papers: dict, ident: dict, h: str) -> tuple[str, str]:
 def main(argv=None):
     argv = argv or sys.argv[1:]
     if "--clear" in argv:
-        for p in (MANIFEST, PAPERS, GRAPH):
+        for p in (MANIFEST, PAPERS, GRAPH, REFS):
             if p.exists():
                 p.unlink()
                 print(f"cleared {p}")
@@ -266,6 +271,7 @@ def main(argv=None):
     manifest = load_json(MANIFEST, {})
     papers = load_json(PAPERS, {})
     graph = load_json(GRAPH, {"nodes": [], "edges": []})
+    refs_cache = load_json(REFS, {})  # sha256 -> {mode, refs: [str]}
     graph.setdefault("nodes", [])
     graph.setdefault("edges", [])
 
@@ -275,7 +281,7 @@ def main(argv=None):
         if isinstance(node, dict) and node.get("sha256")
     }
 
-    new_cnt = skip_cnt = reconcile_cnt = 0
+    new_cnt = skip_cnt = reconcile_cnt = refs_written = 0
     seen_this_run = set()
 
     for pdf in pdfs:
@@ -290,10 +296,20 @@ def main(argv=None):
         needs_reconciliation = not existing or not existing.get("paper_id")
 
         if existing and not needs_reconciliation:
-            print(
-                f"skip  {pdf.name}  {h[:8]}  already integrated"
-                f"  paper={existing['paper_id']}"
-            )
+            # ensure refs are cached even for skips (backfill for older caches)
+            if h not in refs_cache:
+                ident_tmp = identify_pdf(pdf)
+                rec_tmp = ingest_one(pdf, h, ident_tmp)
+                refs_cache[h] = {"mode": rec_tmp.get("mode"), "refs": rec_tmp.get("refs", [])}
+                refs_written += 1
+                print(
+                    f"backfill {pdf.name}  {h[:8]}  refs={rec_tmp.get('references',0):3}  mode={rec_tmp.get('mode')}"
+                )
+            else:
+                print(
+                    f"skip  {pdf.name}  {h[:8]}  already integrated"
+                    f"  paper={existing['paper_id']}"
+                )
             skip_cnt += 1
             continue
 
@@ -316,6 +332,11 @@ def main(argv=None):
                     "version": ident.get("version"),
                     "authors": ident.get("authors", []),
                 })
+            # also backfill refs for this reconciled document
+            if h not in refs_cache:
+                rec_tmp = ingest_one(pdf, h, ident)
+                refs_cache[h] = {"mode": rec_tmp.get("mode"), "refs": rec_tmp.get("refs", [])}
+                refs_written += 1
             print(
                 f"recon {pdf.name}  {h[:8]}  paper={paper_id}"
                 f"  via={recon_status}"
@@ -327,6 +348,12 @@ def main(argv=None):
         rec["paper_id"] = paper_id
         rec["reconciliation"] = recon_status
 
+        # cache the split refs (not thrown away)
+        refs_cache[h] = {"mode": rec.get("mode"), "refs": rec.get("refs", [])}
+        refs_written += 1
+        # don't duplicate large refs array in graph node — keep count there
+        rec_for_graph = {k: v for k, v in rec.items() if k != "refs"}
+
         manifest[h] = {
             **ident,
             "sha256": h,
@@ -336,8 +363,8 @@ def main(argv=None):
             "references": rec.get("references", 0),
             "mode": rec.get("mode"),
         }
-        graph["nodes"].append(rec)
-        graph_by_hash[h] = rec
+        graph["nodes"].append(rec_for_graph)
+        graph_by_hash[h] = rec_for_graph
 
         extra = f" | {rec.get('error')}" if rec.get("error") else ""
         print(
@@ -350,14 +377,15 @@ def main(argv=None):
     save_json(MANIFEST, manifest)
     save_json(PAPERS, papers)
     save_json(GRAPH, graph)
+    save_json(REFS, refs_cache)
 
     print(
         f"\ndone: scanned={len(pdfs)} new={new_cnt} reconciled={reconcile_cnt}"
-        f" skip={skip_cnt}"
+        f" skip={skip_cnt} refs_written={refs_written}"
     )
     print(
         f"identity: documents={len(manifest)} papers={len(papers)}"
-        f"  stores={MANIFEST}, {PAPERS}"
+        f"  refs={len(refs_cache)} docs  stores={MANIFEST}, {PAPERS}, {REFS}"
     )
     return 0
 
