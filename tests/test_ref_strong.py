@@ -1,6 +1,6 @@
 import unittest
 
-from ingest import _get_or_create_paper_for_ref, _migrate_papers_cache, _parse_reference
+from ingest import _enrich_ref_with_evidence, _get_or_create_paper_for_ref, _migrate_papers_cache, _parse_reference
 from reconcile import make_evidence, reconcile_document
 
 
@@ -198,6 +198,97 @@ class RefStrongIdTests(unittest.TestCase):
         self.assertEqual(papers["arxiv:2401.12345"]["title"], "Keep this")
         self.assertEqual(papers["arxiv:2401.12345"]["documents"], ["a" * 64])
         self.assertFalse(_migrate_papers_cache(papers))
+
+
+class RefEvidenceTests(unittest.TestCase):
+    def test_author_year_extracts_ordered_authors_and_punctuated_title(self):
+        ref = _parse_reference(
+            "Smith, J., Doe, A. (2020). A study of GPT-4: R&D in 3D. Journal of Tests, 12."
+        )
+
+        self.assertEqual(ref["authors"], ["Smith, J.", "Doe, A."])
+        self.assertEqual(ref["title"], "A study of GPT-4: R&D in 3D")
+        self.assertEqual(ref["title_norm"], "a study of gpt-4 r&d in 3d")
+        self.assertTrue(ref["authors_complete"])
+
+    def test_full_name_author_list_extracts_title(self):
+        ref = _parse_reference(
+            "John Smith and Alice Doe. A title: GPT-4, R&D, 3D. In Proceedings of Tests, 2021."
+        )
+
+        self.assertEqual(ref["authors"], ["John Smith", "Alice Doe"])
+        self.assertEqual(ref["title"], "A title: GPT-4, R&D, 3D")
+
+    def test_quoted_title_extracts_authors_before_quote(self):
+        ref = _parse_reference('John Smith and Alice Doe. "Quoted title: GPT-4". In Tests, 2020.')
+
+        self.assertEqual(ref["authors"], ["John Smith", "Alice Doe"])
+        self.assertEqual(ref["title"], "Quoted title: GPT-4")
+
+    def test_et_al_marks_author_evidence_incomplete(self):
+        ref = _parse_reference("Smith, J., Doe, A., et al. A title. In Journal, 2020.")
+
+        self.assertEqual(ref["authors"], ["Smith, J.", "Doe, A."])
+        self.assertFalse(ref["authors_complete"])
+        self.assertEqual(ref["title"], "A title")
+
+    def test_organization_prefix_does_not_become_a_person_author(self):
+        for raw, title in (
+            (
+                "Adobe. 2012. Digital Negative (DNG) Specification. In Tests, 2012.",
+                "Digital Negative (DNG) Specification",
+            ),
+            (
+                "National Institute of Standards and Technology. 2020. A reference title. In Tests, 2020.",
+                "A reference title",
+            ),
+        ):
+            with self.subTest(raw=raw):
+                ref = _parse_reference(raw)
+                self.assertNotIn("authors", ref)
+                self.assertEqual(ref["title"], title)
+
+    def test_ambiguous_prose_is_left_unparsed(self):
+        ref = _parse_reference("This is prose about Smith, J. and Doe, A. with no citation title.")
+
+        self.assertNotIn("title", ref)
+        self.assertNotIn("authors", ref)
+
+    def test_title_stops_before_url_and_venue_only_references_are_skipped(self):
+        with_url = _parse_reference(
+            "S. Boyd, L. Xiao, and A. Mutapcic. Subgradient methods.https://example.test/subgrad.pdf, 2003."
+        )
+        venue_only = _parse_reference(
+            "Donnelly, J. and Roegiest, A., 2019. European Conference on Information Retrieval, pp. 795--802."
+        )
+
+        self.assertEqual(with_url["title"], "Subgradient methods")
+        self.assertNotIn("http", with_url["title"])
+        self.assertNotIn("title", venue_only)
+
+    def test_enrichment_adds_evidence_without_overwriting_resolution(self):
+        raw = "John Smith and Alice Doe. A title: GPT-4, R&D, 3D. In Proceedings of Tests, 2021."
+        ref = {
+            "index": 7,
+            "raw": raw,
+            "doi": "10.9999/existing",
+            "arxiv": "9999.99999",
+            "arxiv_version": "v9",
+            "paper_id": "arxiv:2101.12345",
+            "status": "resolved",
+            "resolved_via": "arxiv",
+        }
+
+        self.assertTrue(_enrich_ref_with_evidence(ref))
+        self.assertEqual(ref["raw"], raw)
+        self.assertEqual(ref["index"], 7)
+        self.assertEqual(ref["doi"], "10.9999/existing")
+        self.assertEqual(ref["arxiv"], "9999.99999")
+        self.assertEqual(ref["arxiv_version"], "v9")
+        self.assertEqual(ref["paper_id"], "arxiv:2101.12345")
+        self.assertEqual(ref["status"], "resolved")
+        self.assertEqual(ref["resolved_via"], "arxiv")
+        self.assertFalse(_enrich_ref_with_evidence(ref))
 
 
 if __name__ == "__main__":

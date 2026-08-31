@@ -34,6 +34,8 @@ from reconcile import (
     make_evidence,
     normalize_arxiv,
     normalize_doi,
+    normalize_title,
+    parse_author_list,
     reconcile_document,
 )
 from split_refs import split_bib
@@ -44,6 +46,29 @@ ARXIV_FN = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?", re.I)
 ARXIV_STAMP = re.compile(r"arXiv:\s*(\d{4}\.\d{4,5})(v\d+)\s*\[([^\]]+)\]\s*(\d+\s+\w+\s+\d{4})", re.I)
 ARXIV_DATE = re.compile(r"(\d{2})(\d{2})\.\d+")
 YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+_YEAR_TOKEN = r"(?:19|20)\d{2}[a-z]?"
+_PREFIX_YEAR_RE = re.compile(
+    rf"^(?P<authors>.+?)(?:\s*[.,]\s*|\s+\(\s*){_YEAR_TOKEN}\s*\)?\s*[.:,]?\s+(?P<rest>.+)$",
+    re.I,
+)
+_NAME_TOKEN_RE = re.compile(r"[^\W\d_]+(?:[-'’][^\W\d_]+)*\.?", re.UNICODE)
+_NAME_PARTICLES = {"al", "bin", "da", "de", "del", "den", "der", "di", "du", "la", "le", "st", "ten", "van", "von"}
+_AUTHOR_STOPWORDS = {
+    "a", "an", "the", "this", "that", "what", "why", "how", "in", "on", "of", "for",
+    "you", "using", "dataset", "details", "implementation", "baseline", "conference", "track",
+    "proceedings", "computational", "linguistics", "language", "processing", "evaluation", "method",
+    "analysis", "edit", "succ",
+}
+_AUTHOR_METADATA_WORDS = {
+    "acm", "arxiv", "doi", "eds", "ieee", "issue", "journal", "no", "pages", "pp", "proc",
+    "published", "vol", "volume",
+}
+_ORGANIZATION_MARKERS = {
+    "agency", "association", "center", "centre", "college", "committee", "company", "consortium",
+    "corporation", "foundation", "institute", "laboratory", "ministry", "organization", "organisation",
+    "research", "society", "technology", "technologies", "university",
+}
+_TITLE_ABBREVIATION_RE = re.compile(r"\b(?:e\.g|i\.e|etc|vs|fig|no|vol|pp|dr|mr|ms|prof)\.$", re.I)
 
 CACHE_DIR = Path(".cache")
 MANIFEST = CACHE_DIR / "lineage2.json"
@@ -86,6 +111,242 @@ def _normalize_stamp_date(s: str | None) -> str | None:
     return None
 
 
+def _author_parts(text: str) -> tuple[list[str], bool]:
+    """Return conservative ordered author pieces and whether et al. made them partial."""
+    s = re.sub(r"\s+", " ", text or "").strip(" ,;")
+    incomplete = bool(re.search(r"\bet\s+al\.?\b", s, re.I))
+    s = re.sub(r"(?:,?\s*(?:and\s+)?et\s+al\.?)\s*$", "", s, flags=re.I).strip(" ,;")
+    s = re.sub(r"\s+(?:and|&)\s+", ", ", s, flags=re.I)
+    chunks = [p.strip() for p in re.split(r"\s*;\s*", s) if p.strip()]
+    pieces = []
+    for chunk in chunks:
+        comma_parts = [p.strip() for p in chunk.split(",") if p.strip()]
+        i = 0
+        while i < len(comma_parts):
+            part = comma_parts[i]
+            part_tokens = _NAME_TOKEN_RE.findall(part)
+            next_tokens = _NAME_TOKEN_RE.findall(comma_parts[i + 1]) if i + 1 < len(comma_parts) else []
+            if (
+                i + 1 < len(comma_parts)
+                and len(part_tokens) == 1
+                and 1 <= len(next_tokens) <= 2
+                and (len(next_tokens) == 1 or all(len(token.rstrip(".")) == 1 for token in next_tokens))
+            ):
+                pieces.append(f"{part}, {comma_parts[i + 1]}")
+                i += 2
+            else:
+                pieces.append(part)
+                i += 1
+    return pieces, incomplete
+
+
+def _is_author_piece(text: str) -> bool:
+    s = re.sub(r"\s+", " ", text or "").strip(" ,.;")
+    if not s or len(s) > 80 or re.search(r"[0-9@/:\[\]{}()\"“”+=<>|•]", s):
+        return False
+    tokens = _NAME_TOKEN_RE.findall(s)
+    max_tokens = 6 if "," in s else 4
+    if not 2 <= len(tokens) <= max_tokens or not parse_author_list([s]):
+        return False
+    cores = [token.rstrip(".") for token in tokens]
+    if any(core.casefold() in _AUTHOR_METADATA_WORDS for core in cores):
+        return False
+    if any(not core or not core[0].isupper() and core.casefold() not in _NAME_PARTICLES for core in cores):
+        return False
+    if any(
+        token.endswith(".")
+        and len(core) > 1
+        and core.casefold() not in {"jr", "sr"} | _NAME_PARTICLES
+        for token, core in zip(tokens, cores)
+    ):
+        return False
+    first = cores[0].casefold()
+    if first in _AUTHOR_STOPWORDS and "." not in tokens[0]:
+        return False
+    if len(tokens) > 2 and "," not in s and not any(token.endswith(".") or len(core) == 1 for token, core in zip(tokens, cores)):
+        return False
+    if "," in s:
+        surname = cores[0]
+        if len(surname) < 2 or (len(cores[-1]) != 1 and len(cores) > 3):
+            return False
+    elif len(cores[-1]) < 2:
+        return False
+    return True
+
+
+def _parse_author_evidence(text: str) -> tuple[list[str], bool]:
+    pieces, incomplete = _author_parts(text)
+    if not pieces or not all(_is_author_piece(piece) for piece in pieces):
+        return [], incomplete
+    authors = [re.sub(r"\s+", " ", piece).strip() for piece in pieces]
+    if len(parse_author_list(authors)) != len(authors):
+        return [], incomplete
+    return authors, not incomplete
+
+
+def _clean_title(text: str) -> str:
+    title = re.sub(r"\s+", " ", text or "").strip()
+    title = re.split(r"(?=(?:https?://|www\.|(?:arxiv|doi)\s*:))", title, maxsplit=1, flags=re.I)[0].rstrip()
+    if title.endswith(".") and not title.endswith("..."):
+        title = title[:-1].rstrip()
+    title = re.sub(r"\s*[,;]\s*(?:19|20)\d{2}[a-z]?\s*$", "", title, flags=re.I)
+    title = re.sub(r"\s*\((?:19|20)\d{2}[a-z]?\)\s*$", "", title, flags=re.I)
+    title = re.sub(r"\s*,\s+volume\s+\d+\s*$", "", title, flags=re.I)
+    title = re.sub(r"\s*,\s+(?:pp?\.?|pages)\s+\d+(?:\s*[-–—]\s*\d+)?\s*$", "", title, flags=re.I)
+    return title.strip(" ,;")
+
+
+def _is_organization_prefix(text: str) -> bool:
+    tokens = _NAME_TOKEN_RE.findall(text or "")
+    if len(tokens) == 1:
+        return len(tokens[0].rstrip(".")) >= 2 and tokens[0][0].isupper()
+    cores = [token.rstrip(".") for token in tokens]
+    if not 2 <= len(cores) <= 8:
+        return False
+    if any(not core or not core[0].isupper() and core.casefold() not in {"and", "for", "of", "the"} for core in cores):
+        return False
+    return any(core.casefold() in _ORGANIZATION_MARKERS for core in cores)
+
+
+def _title_from_rest(text: str) -> str | None:
+    rest = re.sub(r"\s+", " ", text or "").strip(" ,;")
+    rest = re.sub(r"^(?:(?:18|19|20)\d{2}[a-z]?(?:[.:,])?\s*)+", "", rest, flags=re.I)
+    if not rest or re.match(
+        r"(?:https?://|www\.|(?:arxiv|doi)\s*:|arxiv\s+preprint|corr\b|url\b|"
+        r"(?:in\s+)?(?:the\s+)?(?:proceedings|journal)\b|\(?eds?\.?\)?\s*[,;:])",
+        rest,
+        re.I,
+    ):
+        return None
+    if re.match(r"^in(?:\s*the)?\b", rest, re.I) and re.search(r"\b(?:conference|journal|proceedings)\b", rest[:180], re.I):
+        return None
+    if re.search(r"\b(?:conference|journal)\b", rest[:120], re.I) and re.search(r"\b(?:vol\.?|volume|pp\.?|pages)\s*\d", rest[:180], re.I):
+        return None
+    if re.search(r"\b(?:vol\.?|volume)\s*\d.*\b(?:pp\.?|pages)\s*\d", rest[:220], re.I):
+        return None
+    if re.match(r"^(?:ieee|acm|siam)\b", rest, re.I) and re.search(r"\bconference\b", rest[:180], re.I):
+        return None
+    rest = re.split(r",\s+volume\s+\d+\s+of(?=[A-Z])", rest, maxsplit=1, flags=re.I)[0]
+    inline_venue = re.search(
+        r"[.!?](?:\s*)(?=(?:(?:the\s+)?journal|(?:the\s+)?proceedings|ima\s+journal|"
+        r"arxiv(?:\s+preprint)?|corr|siam|ieee|acm|transactions|international conference|"
+        r"advances in|american mathematical society|springer|nature|neurips|icml|iclr|cvpr|acl|"
+        r"emnlp|distill|dokl|commun|sn)\b)",
+        rest,
+        re.I,
+    )
+    if inline_venue:
+        rest = rest[:inline_venue.start() + 1]
+    for match in re.finditer(r"[.!?](?=\s|$|[,;])", rest):
+        candidate = rest[:match.end()].strip()
+        if len(candidate.rstrip(".!? ")) < 4:
+            continue
+        if match.group(0) == "." and _TITLE_ABBREVIATION_RE.search(candidate):
+            continue
+        title = _clean_title(candidate)
+        if len(title) >= 4 and re.search(r"[A-Za-z]", title):
+            return title
+    url = re.search(r"\s+(?=(?:https?://|www\.|(?:arxiv|doi)\s*:))", rest, re.I)
+    if url:
+        rest = rest[:url.start()]
+    title = _clean_title(rest)
+    if len(title) < 4 or len(title) > 220 or not re.search(r"[A-Za-z]", title):
+        return None
+    if re.search(r"(?:https?://|www\.|(?:arxiv|doi)\s*:|arxiv\s+preprint)", title, re.I):
+        return None
+    return title
+
+
+def _starts_author_continuation(rest: str) -> bool:
+    if re.match(r"et\s+al\.?\b", rest, re.I):
+        return True
+    if re.match(r"(?:and|&)\s+", rest, re.I):
+        return True
+    if re.match(r"^[A-Z](?:\.-?[A-Z])?\.?\s*,", rest):
+        return True
+    if re.match(r"^[A-Z](?:\.-?[A-Z])?\.\s+(?:and|&)\s+", rest, re.I):
+        return True
+    if re.match(r"^[A-Z](?:\.-?[A-Z])?\.\s+[A-Z][a-z]", rest):
+        return True
+    if re.match(r"^[A-Z][a-z'’\-]{2,},\s+[A-Z][a-z'’\-]{2,}(?:\s+[A-Z][a-z'’\-]{2,})*(?:[,.;]|$)", rest):
+        return True
+    if re.match(r"^(?:" + "|".join(_NAME_PARTICLES) + r")\s+[A-Z][^,.;]{1,50},", rest, re.I):
+        return True
+    if re.match(r"^[A-Z][^,.;]{1,70},\s*[A-Z](?:[.\s,;]|$)", rest):
+        return True
+    head = re.split(r"[.!?](?=\s|$)", rest, maxsplit=1)[0]
+    if not ("," in head or re.search(r"\s+(?:and|&)\s+", head, re.I)):
+        return False
+    pieces, _ = _author_parts(head)
+    if len(pieces) >= 2 and all(_is_author_piece(piece) for piece in pieces):
+        return True
+    comma_parts = [part.strip() for part in rest.split(",") if part.strip()]
+    if len(comma_parts) >= 3:
+        first = f"{comma_parts[0]}, {comma_parts[1]}"
+        return bool(_parse_author_evidence(first)[0])
+    first_comma = re.match(r"^([^,;]+,\s*[^,;]+)\s*[,;]", rest)
+    return bool(first_comma and _parse_author_evidence(first_comma.group(1))[0])
+
+
+def _title_author_evidence(raw: str) -> dict:
+    """Extract only structurally defensible title/author evidence from one raw citation."""
+    text = re.sub(r"\s+", " ", raw or "").strip()
+    text = re.sub(r"\s+\.", ".", text)
+    if len(text) < 8:
+        return {}
+
+    quote = re.search(r"[\"“](.+?)[\"”]", text)
+    if quote:
+        authors, complete = _parse_author_evidence(text[:quote.start()].strip(" ,.;"))
+        title = _clean_title(quote.group(1))
+        if authors and len(title) >= 4:
+            return {
+                "title": title,
+                "title_norm": normalize_title(title),
+                "authors": authors,
+                "authors_norm": parse_author_list(authors),
+                "authors_complete": complete,
+            }
+
+    prefix = _PREFIX_YEAR_RE.match(text)
+    if prefix and len(prefix.group("authors")) <= 320:
+        prefix_authors, complete = _parse_author_evidence(prefix.group("authors"))
+        title = _title_from_rest(prefix.group("rest"))
+        if title:
+            result = {"title": title, "title_norm": normalize_title(title)}
+            if prefix_authors:
+                result.update(
+                    authors=prefix_authors,
+                    authors_norm=parse_author_list(prefix_authors),
+                    authors_complete=complete,
+                )
+            elif _is_organization_prefix(prefix.group("authors")):
+                return result
+            if prefix_authors:
+                return result
+
+    for boundary in re.finditer(r"\.", text):
+        if (boundary.start() and text[boundary.start() - 1] == "-") or text[boundary.end():].startswith("-"):
+            continue
+        authors, complete = _parse_author_evidence(text[:boundary.start()])
+        if not authors:
+            continue
+        rest = text[boundary.end():].lstrip(" ,;:")
+        if not rest or _starts_author_continuation(rest):
+            continue
+        title = _title_from_rest(rest)
+        if not title:
+            return {}
+        return {
+            "title": title,
+            "title_norm": normalize_title(title),
+            "authors": authors,
+            "authors_norm": parse_author_list(authors),
+            "authors_complete": complete,
+        }
+    return {}
+
+
 def _parse_reference(raw: str) -> dict:
     """Deterministic evidence from a raw split reference — no resolution, no network."""
     doi = extract_doi(raw)
@@ -109,6 +370,7 @@ def _parse_reference(raw: str) -> dict:
             out["arxiv_version"] = arxiv_version
     if year:
         out["year"] = year
+    out.update(_title_author_evidence(raw))
     return out
 
 
