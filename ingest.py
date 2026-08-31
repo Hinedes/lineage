@@ -153,7 +153,7 @@ def _migrate_refs_cache(refs_cache: dict) -> bool:
 
 
 def _canonical_strong_id(ref: dict) -> tuple[str | None, str | None]:
-    """Return (paper_id, via) for strong IDs only (doi/arxiv), else (None, None)."""
+    """Return (paper_id, via) for strong IDs only (doi/arxiv), else (None, None). — legacy, use _find_strong_matches."""
     doi = ref.get("doi")
     if doi:
         norm = normalize_doi(doi)
@@ -167,24 +167,57 @@ def _canonical_strong_id(ref: dict) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _find_strong_matches(papers: dict, doi_norm: str | None, arxiv_base: str | None) -> dict[str, str]:
+    """Scan papers for matching doi/arxiv evidence, not just dict keys. Returns {paper_id: via}."""
+    matches: dict[str, str] = {}
+    if doi_norm:
+        for pid, paper in papers.items():
+            if paper.get("doi") == doi_norm:
+                matches[pid] = "doi"
+    if arxiv_base:
+        for pid, paper in papers.items():
+            if paper.get("arxiv") == arxiv_base:
+                # if same paper already matched via doi, keep first via (doi) — same paper via both
+                if pid not in matches:
+                    matches[pid] = "arxiv"
+    return matches
+
+
 def _get_or_create_paper_for_ref(papers: dict, ref: dict) -> tuple[str | None, str | None]:
-    """Get or create minimal paper for a strong-ID ref. Returns (paper_id, via) or (None, None)."""
-    paper_id, via = _canonical_strong_id(ref)
-    if not paper_id:
+    """Get or create minimal paper for a strong-ID ref, reusing existing paper evidence.
+    Returns (paper_id, via) or (None, None) for unresolved/conflict.
+    """
+    doi_norm = normalize_doi(ref.get("doi")) if ref.get("doi") else None
+    arxiv_raw = ref.get("arxiv")
+    arxiv_base, arxiv_version_norm = normalize_arxiv(arxiv_raw) if arxiv_raw else (None, None)
+    # version from ref evidence (explicit) takes precedence for storage, but paper identity is base only
+    arxiv_version = ref.get("arxiv_version") or arxiv_version_norm
+
+    if not doi_norm and not arxiv_base:
         return None, None
+
+    matches = _find_strong_matches(papers, doi_norm, arxiv_base)
+    if len(matches) == 1:
+        pid, via = next(iter(matches.items()))
+        return pid, via
+    if len(matches) > 1:
+        # both identifiers point to different existing papers -> identity conflict, don't silently choose
+        return None, None
+
+    # no existing match -> create minimal new paper
+    # canonical id prefers doi if present? follow reconcile: arxiv first, but for refs with both we store both
+    # so future DOI-only or arXiv-only refs will find it via scan
+    if doi_norm:
+        paper_id = f"doi:{doi_norm}"
+        via = "doi"
+    else:
+        paper_id = f"arxiv:{arxiv_base}"
+        via = "arxiv"
+    # if ref has both, still create with single canonical id but store both identifiers
+    # check if canonical id already exists (should not, since matches==0, but be safe)
     if paper_id in papers:
         return paper_id, via
-    # create minimal paper from strong identifier only — no invented title/authors/year beyond evidence
-    doi = ref.get("doi")
-    arxiv = ref.get("arxiv")
-    arxiv_version = ref.get("arxiv_version")
-    # normalize via helpers for consistency
-    norm_doi = normalize_doi(doi) if doi else None
-    norm_arxiv, norm_version = normalize_arxiv(arxiv) if arxiv else (None, None)
-    # use provided version if present, else normalized
-    version = arxiv_version or norm_version
-    evidence = make_evidence(title="", authors=[], doi=norm_doi, arxiv=norm_arxiv, arxiv_version=version)
-    # build minimal paper record
+    evidence = make_evidence(title="", authors=[], doi=doi_norm, arxiv=arxiv_base, arxiv_version=arxiv_version)
     papers[paper_id] = {
         "id": paper_id,
         "doi": evidence.get("doi"),
@@ -196,9 +229,14 @@ def _get_or_create_paper_for_ref(papers: dict, ref: dict) -> tuple[str | None, s
         "authors_norm": [],
         "documents": [],
     }
-    # keep year if present in ref evidence and not inventing otherwise
     if ref.get("year"):
         papers[paper_id]["year"] = ref["year"]
+    # if ref had both identifiers, ensure the non-canonical one is also stored for future matching
+    # (e.g., arxiv paper created via doi, but also has arxiv)
+    if doi_norm and arxiv_base:
+        # paper_id is doi:... but we also want arxiv field set (already via evidence)
+        # if we chose arxiv as canonical, also need doi field (already)
+        pass
     return paper_id, via
 
 
