@@ -82,11 +82,12 @@ _VENUE_PREFIX = (
     r"american\s+mathematical\s+society|springer|nature|neurips|icml|iclr|cvpr|"
     r"acl|emnlp|distill|dokl|commun|sn)"
 )
-REF_EVIDENCE_VERSION = 2
+REF_EVIDENCE_VERSION = 3
 DERIVED_EVIDENCE_FIELDS = (
     "doi", "arxiv", "arxiv_version", "year", "title", "title_norm", "authors", "authors_norm",
     "authors_complete",
 )
+RESOLUTION_FIELDS = ("paper_id", "status", "resolved_via")
 
 CACHE_DIR = Path(".cache")
 MANIFEST = CACHE_DIR / "lineage2.json"
@@ -392,16 +393,34 @@ def _new_ref(index: int, raw: str) -> dict:
     return {"index": index, "raw": raw, **_parse_reference(raw), "evidence_version": REF_EVIDENCE_VERSION}
 
 
+def _normalized_strong_evidence(ref: dict) -> tuple[str | None, str | None]:
+    doi = normalize_doi(ref.get("doi")) if ref.get("doi") else None
+    arxiv, _ = normalize_arxiv(ref.get("arxiv")) if ref.get("arxiv") else (None, None)
+    return doi, arxiv
+
+
+def _clear_ref_resolution(ref: dict) -> bool:
+    changed = False
+    for field in RESOLUTION_FIELDS:
+        if field in ref:
+            del ref[field]
+            changed = True
+    return changed
+
+
 def _enrich_ref_with_evidence(ref: dict) -> bool:
-    """Refresh derived evidence while preserving source and resolution fields."""
+    """Refresh derived evidence, invalidating resolution only when strong IDs change."""
     if ref.get("evidence_version") == REF_EVIDENCE_VERSION:
         return False
+    old_strong = _normalized_strong_evidence(ref)
     raw = ref.get("raw", "")
     for field in DERIVED_EVIDENCE_FIELDS:
         ref.pop(field, None)
     parsed = _parse_reference(raw)
     ref.update(parsed)
     ref["evidence_version"] = REF_EVIDENCE_VERSION
+    if old_strong != _normalized_strong_evidence(ref):
+        _clear_ref_resolution(ref)
     return True
 
 
@@ -416,7 +435,7 @@ def _migrate_refs_cache(refs_cache: dict) -> bool:
             entry["refs"] = [_new_ref(i, s) for i, s in enumerate(refs)]
             mutated = True
         elif isinstance(refs[0], dict):
-            # preserve index/raw and every resolution field while refreshing parser evidence
+            # preserve index/raw and unchanged resolution fields while refreshing evidence
             for r in refs:
                 if _enrich_ref_with_evidence(r):
                     mutated = True
@@ -453,11 +472,13 @@ def _find_strong_matches(papers: dict, doi_norm: str | None, arxiv_base: str | N
     matches: dict[str, str] = {}
     if doi_norm:
         for pid, paper in papers.items():
-            if paper.get("doi") == doi_norm:
+            paper_doi, _ = _normalized_strong_evidence(paper)
+            if paper_doi == doi_norm:
                 matches[pid] = "doi"
     if arxiv_base:
         for pid, paper in papers.items():
-            if paper.get("arxiv") == arxiv_base:
+            _, paper_arxiv = _normalized_strong_evidence(paper)
+            if paper_arxiv == arxiv_base:
                 # if same paper already matched via doi, keep first via (doi) — same paper via both
                 if pid not in matches:
                     matches[pid] = "arxiv"
@@ -480,9 +501,10 @@ def _get_or_create_paper_for_ref(papers: dict, ref: dict) -> tuple[str | None, s
         pid, via = next(iter(matches.items()))
         paper = papers[pid]
         # conflict check: if reference brings an identifier that differs from already-stored value
-        if doi_norm and paper.get("doi") and paper["doi"] != doi_norm:
+        paper_doi, paper_arxiv = _normalized_strong_evidence(paper)
+        if doi_norm and paper_doi and paper_doi != doi_norm:
             return None, None
-        if arxiv_base and paper.get("arxiv") and paper["arxiv"] != arxiv_base:
+        if arxiv_base and paper_arxiv and paper_arxiv != arxiv_base:
             return None, None
         # enrich paper with missing non-conflicting strong identifiers
         if doi_norm and not paper.get("doi"):
@@ -506,6 +528,14 @@ def _get_or_create_paper_for_ref(papers: dict, ref: dict) -> tuple[str | None, s
     # if ref has both, still create with single canonical id but store both identifiers
     # check if canonical id already exists (should not, since matches==0, but be safe)
     if paper_id in papers:
+        paper = papers[paper_id]
+        paper_doi, paper_arxiv = _normalized_strong_evidence(paper)
+        if (doi_norm and paper_doi and paper_doi != doi_norm) or (arxiv_base and paper_arxiv and paper_arxiv != arxiv_base):
+            return None, None
+        if doi_norm and not paper.get("doi"):
+            paper["doi"] = doi_norm
+        if arxiv_base and not paper.get("arxiv"):
+            paper["arxiv"] = arxiv_base
         return paper_id, via
     evidence = make_evidence(title="", authors=[], doi=doi_norm, arxiv=arxiv_base)
     papers[paper_id] = {
@@ -527,6 +557,60 @@ def _get_or_create_paper_for_ref(papers: dict, ref: dict) -> tuple[str | None, s
         # if we chose arxiv as canonical, also need doi field (already)
         pass
     return paper_id, via
+
+
+def _strong_evidence_matches_paper(ref: dict, paper: dict) -> bool:
+    """Only trust a cached resolution when current strong evidence matches its target."""
+    doi_norm, arxiv_base = _normalized_strong_evidence(ref)
+    if not doi_norm and not arxiv_base:
+        return False
+    paper_doi = normalize_doi(paper.get("doi")) if paper.get("doi") else None
+    paper_arxiv, _ = normalize_arxiv(paper.get("arxiv")) if paper.get("arxiv") else (None, None)
+    if doi_norm and paper_doi and paper_doi != doi_norm:
+        return False
+    if arxiv_base and paper_arxiv and paper_arxiv != arxiv_base:
+        return False
+    return bool((doi_norm and paper_doi == doi_norm) or (arxiv_base and paper_arxiv == arxiv_base))
+
+
+def _resolve_ref(papers: dict, ref: dict) -> tuple[str | None, str | None, bool]:
+    """Resolve one ref, invalidating stale cached linkage before using current evidence."""
+    paper_id = ref.get("paper_id")
+    if ref.get("status") == "resolved" and paper_id in papers:
+        if _strong_evidence_matches_paper(ref, papers[paper_id]):
+            return paper_id, ref.get("resolved_via"), False
+
+    changed = _clear_ref_resolution(ref)
+    paper_id, via = _get_or_create_paper_for_ref(papers, ref)
+    if not paper_id:
+        return None, None, changed
+    if ref.get("paper_id") != paper_id or ref.get("status") != "resolved" or ref.get("resolved_via") != via:
+        ref["paper_id"] = paper_id
+        ref["status"] = "resolved"
+        ref["resolved_via"] = via
+        changed = True
+    return paper_id, via, changed
+
+
+def _build_current_edges(refs_cache: dict, manifest: dict, papers: dict) -> set[tuple[str, str]]:
+    """Build citation edges solely from refs resolved against current paper evidence."""
+    edge_set = set()
+    for doc_sha, entry in refs_cache.items():
+        manifest_entry = manifest.get(doc_sha)
+        if not manifest_entry or not manifest_entry.get("paper_id"):
+            continue
+        source_paper = manifest_entry["paper_id"]
+        if source_paper not in papers:
+            continue
+        for ref in entry.get("refs", []):
+            target = ref.get("paper_id")
+            if (
+                ref.get("status") == "resolved"
+                and target in papers
+                and _strong_evidence_matches_paper(ref, papers[target])
+            ):
+                edge_set.add((source_paper, target))
+    return edge_set
 
 
 def identify_pdf(pdf: Path) -> dict:
@@ -862,14 +946,6 @@ def main(argv=None):
     refs_resolve_dirty = False
     papers_before = len(papers)
     # build deduplicated edges from resolved refs
-    edge_set = set()
-    # preload existing edges to keep idempotency (if graph already has edges, preserve set)
-    for e in graph.get("edges", []):
-        # support both {"from","to"} and {"source","target"}
-        src = e.get("from") or e.get("source")
-        tgt = e.get("to") or e.get("target")
-        if src and tgt:
-            edge_set.add((src, tgt))
     # resolve each ref
     for doc_sha, entry in refs_cache.items():
         manifest_entry = manifest.get(doc_sha)
@@ -880,36 +956,11 @@ def main(argv=None):
         if source_paper not in papers:
             continue
         for ref in entry.get("refs", []):
-            # if already resolved and points to existing paper, count and keep edge
-            if ref.get("status") == "resolved" and ref.get("paper_id") and ref.get("paper_id") in papers:
-                # ensure edge exists for already-resolved refs (idempotent, no rewrite if already present)
-                tgt = ref["paper_id"]
-                if (source_paper, tgt) not in edge_set:
-                    edge_set.add((source_paper, tgt))
-                    refs_resolve_dirty = True
-                # count for reporting
-                via = ref.get("resolved_via")
-                if via == "arxiv":
-                    arxiv_resolved += 1
-                elif via == "doi":
-                    doi_resolved += 1
-                refs_resolved += 1
-                continue
-            # need strong ID
-            paper_id, via = _get_or_create_paper_for_ref(papers, ref)
+            paper_id, via, changed = _resolve_ref(papers, ref)
+            refs_resolve_dirty |= changed
             if not paper_id:
                 refs_unresolved += 1
                 continue
-            # mark ref as resolved — preserve raw/index, add only resolution fields
-            if ref.get("paper_id") != paper_id or ref.get("status") != "resolved" or ref.get("resolved_via") != via:
-                ref["paper_id"] = paper_id
-                ref["status"] = "resolved"
-                ref["resolved_via"] = via
-                refs_resolve_dirty = True
-            # deduplicate edge but keep each ref addressable
-            if (source_paper, paper_id) not in edge_set:
-                edge_set.add((source_paper, paper_id))
-                refs_resolve_dirty = True
             if via == "arxiv":
                 arxiv_resolved += 1
             elif via == "doi":
@@ -932,6 +983,8 @@ def main(argv=None):
         doi_resolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("resolved_via") == "doi")
         refs_resolved = arxiv_resolved + doi_resolved
         refs_unresolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("status") != "resolved")
+    # graph.json is a cache; citation edges come only from current resolved refs.
+    edge_set = _build_current_edges(refs_cache, manifest, papers)
     # rebuild graph: nodes are papers (not documents), edges are deduplicated citations
     # deterministically sort for idempotency
     new_nodes = sorted(papers.values(), key=lambda p: p["id"])

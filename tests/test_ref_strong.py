@@ -1,14 +1,30 @@
+import json
 import unittest
 
 from ingest import (
     REF_EVIDENCE_VERSION,
+    _build_current_edges,
     _enrich_ref_with_evidence,
     _get_or_create_paper_for_ref,
     _migrate_papers_cache,
     _migrate_refs_cache,
     _parse_reference,
+    _resolve_ref,
 )
 from reconcile import make_evidence, reconcile_document
+
+
+def _paper(paper_id, *, doi=None, arxiv=None):
+    return {
+        "id": paper_id,
+        "doi": doi,
+        "arxiv": arxiv,
+        "title": "",
+        "title_norm": "",
+        "authors": [],
+        "authors_norm": [],
+        "documents": [],
+    }
 
 
 class RefStrongIdTests(unittest.TestCase):
@@ -310,13 +326,13 @@ class RefEvidenceTests(unittest.TestCase):
                 ref = _parse_reference(raw)
                 self.assertEqual(ref["title"], expected_title)
 
-    def test_enrichment_refreshes_derived_evidence_without_overwriting_resolution(self):
+    def test_enrichment_preserves_resolution_when_strong_evidence_is_unchanged(self):
         raw = "John Smith and Alice Doe. A title: GPT-4, R&D, 3D. arXiv:2101.12345v2, 2021. doi:10.1234/parsed"
         ref = {
             "index": 7,
             "raw": raw,
-            "doi": "10.9999/existing",
-            "arxiv": "9999.99999",
+            "doi": "https://doi.org/10.1234/parsed",
+            "arxiv": "2101.12345",
             "arxiv_version": "v9",
             "paper_id": "arxiv:2101.12345",
             "status": "resolved",
@@ -334,6 +350,138 @@ class RefEvidenceTests(unittest.TestCase):
         self.assertEqual(ref["resolved_via"], "arxiv")
         self.assertEqual(ref["evidence_version"], REF_EVIDENCE_VERSION)
         self.assertFalse(_enrich_ref_with_evidence(ref))
+
+    def test_changed_arxiv_invalidates_resolution_and_rebuilds_only_current_edge(self):
+        raw = "Some paper arXiv:2222.22222"
+        cache = {
+            "doc": {
+                "refs": [{
+                    "index": 0,
+                    "raw": raw,
+                    "arxiv": "1111.11111",
+                    "paper_id": "arxiv:1111.11111",
+                    "status": "resolved",
+                    "resolved_via": "arxiv",
+                    "evidence_version": REF_EVIDENCE_VERSION - 1,
+                }],
+            }
+        }
+        source = "arxiv:0000.00000"
+        papers = {
+            source: _paper(source, arxiv="0000.00000"),
+            "arxiv:1111.11111": _paper("arxiv:1111.11111", arxiv="1111.11111"),
+            "arxiv:2222.22222": _paper("arxiv:2222.22222", arxiv="2222.22222"),
+        }
+        manifest = {"doc": {"paper_id": source}}
+
+        self.assertTrue(_migrate_refs_cache(cache))
+        ref = cache["doc"]["refs"][0]
+        self.assertNotIn("paper_id", ref)
+        self.assertNotIn("status", ref)
+        self.assertNotIn("resolved_via", ref)
+
+        paper_id, via, changed = _resolve_ref(papers, ref)
+        self.assertTrue(changed)
+        self.assertEqual((paper_id, via), ("arxiv:2222.22222", "arxiv"))
+        self.assertEqual(_build_current_edges(cache, manifest, papers), {(source, "arxiv:2222.22222")})
+
+    def test_equivalent_doi_normalization_preserves_resolution(self):
+        raw = "A paper. doi:10.1234/ABC."
+        ref = {
+            "index": 0,
+            "raw": raw,
+            "doi": "https://doi.org/10.1234/ABC",
+            "paper_id": "doi:10.1234/abc",
+            "status": "resolved",
+            "resolved_via": "doi",
+            "evidence_version": REF_EVIDENCE_VERSION - 1,
+        }
+        cache = {"doc": {"refs": [ref]}}
+        papers = {ref["paper_id"]: _paper(ref["paper_id"], doi="10.1234/abc")}
+
+        self.assertTrue(_migrate_refs_cache(cache))
+        paper_id, via, changed = _resolve_ref(papers, ref)
+        self.assertFalse(changed)
+        self.assertEqual((paper_id, via), ("doi:10.1234/abc", "doi"))
+        self.assertEqual(ref["doi"], "10.1234/abc")
+
+    def test_title_author_year_refresh_preserves_strong_resolution(self):
+        raw = "John Smith and Alice Doe. New title. doi:10.1234/same. 2021."
+        ref = {
+            "index": 0,
+            "raw": raw,
+            "doi": "10.1234/SAME",
+            "year": "1900",
+            "title": "Stale title",
+            "authors": ["Stale Author"],
+            "paper_id": "doi:10.1234/same",
+            "status": "resolved",
+            "resolved_via": "doi",
+            "resolution_note": "keep",
+            "evidence_version": REF_EVIDENCE_VERSION - 1,
+        }
+        cache = {"doc": {"refs": [ref]}}
+        papers = {ref["paper_id"]: _paper(ref["paper_id"], doi="10.1234/same")}
+        stable = {field: ref[field] for field in ("paper_id", "status", "resolved_via", "resolution_note")}
+
+        self.assertTrue(_migrate_refs_cache(cache))
+        self.assertEqual({field: ref[field] for field in stable}, stable)
+        self.assertEqual(ref["title"], "New title")
+        self.assertEqual(ref["authors"], ["John Smith", "Alice Doe"])
+        self.assertEqual(ref["year"], "2021")
+        self.assertFalse(_resolve_ref(papers, ref)[2])
+
+    def test_disappearing_strong_evidence_clears_resolution_and_edge(self):
+        raw = "John Smith and Alice Doe. A title. 2021."
+        old_target = "arxiv:1111.11111"
+        source = "arxiv:0000.00000"
+        ref = {
+            "index": 0,
+            "raw": raw,
+            "arxiv": "1111.11111",
+            "paper_id": old_target,
+            "status": "resolved",
+            "resolved_via": "arxiv",
+            "evidence_version": REF_EVIDENCE_VERSION - 1,
+        }
+        cache = {"doc": {"refs": [ref]}}
+        papers = {
+            source: _paper(source, arxiv="0000.00000"),
+            old_target: _paper(old_target, arxiv="1111.11111"),
+        }
+        manifest = {"doc": {"paper_id": source}}
+
+        self.assertTrue(_migrate_refs_cache(cache))
+        self.assertIsNone(_resolve_ref(papers, ref)[0])
+        self.assertTrue(all(field not in ref for field in ("paper_id", "status", "resolved_via")))
+        self.assertEqual(_build_current_edges(cache, manifest, papers), set())
+
+    def test_second_migration_and_resolution_are_state_idempotent(self):
+        raw = "A paper. doi:10.1234/ABC."
+        ref = {
+            "index": 0,
+            "raw": raw,
+            "doi": "10.1234/ABC",
+            "paper_id": "doi:10.1234/abc",
+            "status": "resolved",
+            "resolved_via": "doi",
+            "evidence_version": REF_EVIDENCE_VERSION - 1,
+        }
+        cache = {"doc": {"refs": [ref]}}
+        manifest = {"doc": {"paper_id": "arxiv:0000.00000"}}
+        papers = {
+            "arxiv:0000.00000": _paper("arxiv:0000.00000", arxiv="0000.00000"),
+            "doi:10.1234/abc": _paper("doi:10.1234/abc", doi="10.1234/abc"),
+        }
+
+        self.assertTrue(_migrate_refs_cache(cache))
+        self.assertEqual(_resolve_ref(papers, ref)[:2], ("doi:10.1234/abc", "doi"))
+        before = json.dumps({"cache": cache, "papers": papers, "edges": sorted(_build_current_edges(cache, manifest, papers))}, sort_keys=True)
+
+        self.assertFalse(_migrate_refs_cache(cache))
+        self.assertFalse(_resolve_ref(papers, ref)[2])
+        after = json.dumps({"cache": cache, "papers": papers, "edges": sorted(_build_current_edges(cache, manifest, papers))}, sort_keys=True)
+        self.assertEqual(after, before)
 
     def test_evidence_migration_removes_legacy_truncated_title(self):
         raw = "Lisa Torrey and Jude Shavlik. 2010. Transfer learn-"
