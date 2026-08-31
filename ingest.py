@@ -199,6 +199,22 @@ def _get_or_create_paper_for_ref(papers: dict, ref: dict) -> tuple[str | None, s
     matches = _find_strong_matches(papers, doi_norm, arxiv_base)
     if len(matches) == 1:
         pid, via = next(iter(matches.items()))
+        paper = papers[pid]
+        # conflict check: if reference brings an identifier that differs from already-stored value
+        if doi_norm and paper.get("doi") and paper["doi"] != doi_norm:
+            return None, None
+        if arxiv_base and paper.get("arxiv") and paper["arxiv"] != arxiv_base:
+            return None, None
+        # enrich paper with missing non-conflicting strong identifiers
+        if doi_norm and not paper.get("doi"):
+            paper["doi"] = doi_norm
+        if arxiv_base and not paper.get("arxiv"):
+            paper["arxiv"] = arxiv_base
+            if arxiv_version and not paper.get("arxiv_version"):
+                paper["arxiv_version"] = arxiv_version
+        elif arxiv_base and arxiv_version and not paper.get("arxiv_version"):
+            # same arXiv base, missing version -> enrich
+            paper["arxiv_version"] = arxiv_version
         return pid, via
     if len(matches) > 1:
         # both identifiers point to different existing papers -> identity conflict, don't silently choose

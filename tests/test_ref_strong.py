@@ -92,6 +92,77 @@ class RefStrongIdTests(unittest.TestCase):
         # no new paper created for conflict
         self.assertEqual(len(papers), 2)
 
+    def test_doi_only_paper_then_both_then_arxiv_only_one_node(self):
+        # DOI-only paper -> ref with DOI+arXiv enriches -> arXiv-only ref finds same paper
+        papers = {}
+        p_doi, _ = reconcile_document(
+            papers, make_evidence(title="Paper X", authors=["Alice"], doi="10.1234/x"), "a" * 64
+        )
+        self.assertEqual(p_doi, "doi:10.1234/x")
+        self.assertIsNone(papers[p_doi].get("arxiv"))
+
+        ref_both = {"doi": "10.1234/x", "arxiv": "2401.12345", "arxiv_version": "v1", "raw": "Paper doi:10.1234/x arXiv:2401.12345"}
+        pid1, via1 = _get_or_create_paper_for_ref(papers, ref_both)
+        self.assertEqual(pid1, p_doi)
+        # enriched with arXiv
+        self.assertEqual(papers[p_doi].get("arxiv"), "2401.12345")
+        self.assertEqual(len(papers), 1)
+
+        ref_arxiv_only = {"arxiv": "2401.12345", "raw": "Paper arXiv:2401.12345"}
+        pid2, via2 = _get_or_create_paper_for_ref(papers, ref_arxiv_only)
+        self.assertEqual(pid2, p_doi)
+        self.assertEqual(pid2, pid1)
+        self.assertEqual(len(papers), 1)
+        # both identifiers stored on single paper
+        self.assertEqual(papers[p_doi]["doi"], "10.1234/x")
+        self.assertEqual(papers[p_doi]["arxiv"], "2401.12345")
+        # edges dedup
+        source = "arxiv:9999.00000"
+        papers[source] = {"id": source, "arxiv": "9999.00000", "title": "", "title_norm": "", "authors": [], "authors_norm": [], "documents": []}
+        edge_set = {(source, pid1), (source, pid2)}
+        self.assertEqual(len(edge_set), 1)
+
+    def test_arxiv_only_paper_then_both_then_doi_only_one_node(self):
+        # arXiv-only paper -> ref with arXiv+DOI enriches -> DOI-only ref finds same paper
+        papers = {}
+        p_arxiv, _ = reconcile_document(
+            papers, make_evidence(title="Paper Y", authors=["Bob"], arxiv="2401.12345v1"), "a" * 64
+        )
+        self.assertEqual(p_arxiv, "arxiv:2401.12345")
+        self.assertIsNone(papers[p_arxiv].get("doi"))
+
+        ref_both = {"doi": "10.1234/x", "arxiv": "2401.12345", "raw": "Paper arXiv:2401.12345 doi:10.1234/x"}
+        pid1, via1 = _get_or_create_paper_for_ref(papers, ref_both)
+        self.assertEqual(pid1, p_arxiv)
+        self.assertEqual(papers[p_arxiv].get("doi"), "10.1234/x")
+        self.assertEqual(len(papers), 1)
+
+        ref_doi_only = {"doi": "10.1234/x", "raw": "Paper doi:10.1234/x"}
+        pid2, via2 = _get_or_create_paper_for_ref(papers, ref_doi_only)
+        self.assertEqual(pid2, p_arxiv)
+        self.assertEqual(pid2, pid1)
+        self.assertEqual(len(papers), 1)
+        self.assertEqual(papers[p_arxiv]["doi"], "10.1234/x")
+        self.assertEqual(papers[p_arxiv]["arxiv"], "2401.12345")
+        source = "arxiv:9999.00001"
+        papers[source] = {"id": source, "arxiv": "9999.00001", "title": "", "title_norm": "", "authors": [], "authors_norm": [], "documents": []}
+        edge_set = {(source, pid1), (source, pid2)}
+        self.assertEqual(len(edge_set), 1)
+
+    def test_conflicting_enrichment_does_not_overwrite(self):
+        papers = {}
+        p, _ = reconcile_document(
+            papers, make_evidence(title="Paper Z", authors=["Carol"], arxiv="2401.12345v1"), "a" * 64
+        )
+        # add doi to paper
+        papers[p]["doi"] = "10.1234/x"
+        # ref has same arXiv but different DOI -> should conflict, not overwrite
+        ref_conflict = {"doi": "10.9999/other", "arxiv": "2401.12345", "raw": "conflict arXiv 2401.12345 doi 10.9999/other"}
+        pid, via = _get_or_create_paper_for_ref(papers, ref_conflict)
+        self.assertIsNone(pid)
+        self.assertEqual(papers[p]["doi"], "10.1234/x", "should not overwrite existing DOI")
+        self.assertEqual(len(papers), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
