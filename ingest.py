@@ -85,15 +85,57 @@ def _normalize_stamp_date(s: str | None) -> str | None:
     return None
 
 
+def _parse_reference(raw: str) -> dict:
+    """Deterministic evidence from a raw split reference — no resolution, no network."""
+    doi = extract_doi(raw)
+    arxiv_base, arxiv_version = extract_arxiv(raw)
+    # also try normalize_arxiv for bare IDs without 'arXiv:' prefix (e.g. '1905.03277v2')
+    if not arxiv_base:
+        # fallback: search for bare arXiv ID pattern
+        m = re.search(r"\b(\d{4}\.\d{4,5})(v\d+)?\b", raw)
+        if m:
+            arxiv_base, arxiv_version = normalize_arxiv(m.group(0))
+    year = None
+    ym = YEAR_RE.search(raw)
+    if ym:
+        year = ym.group(0)
+    out = {}
+    if doi:
+        out["doi"] = doi
+    if arxiv_base:
+        out["arxiv"] = arxiv_base
+        if arxiv_version:
+            out["arxiv_version"] = arxiv_version
+    if year:
+        out["year"] = year
+    return out
+
+
+def _enrich_ref_with_evidence(ref: dict) -> bool:
+    """Add deterministic evidence fields to a {index, raw} ref if missing. Returns True if mutated."""
+    raw = ref.get("raw", "")
+    # keep already-parsed evidence if present and raw unchanged; only fill missing
+    has_evidence = any(k in ref for k in ("doi", "arxiv", "year"))
+    if has_evidence:
+        # still ensure evidence matches current raw (raw is stable, but if raw changed, re-parse)
+        # for minimal, keep existing; no mutation needed if already has evidence
+        return False
+    parsed = _parse_reference(raw)
+    if parsed:
+        ref.update(parsed)
+        return True
+    return False
+
+
 def _migrate_refs_cache(refs_cache: dict) -> bool:
-    """Migrate old string refs to {index, raw} objects. Returns True if mutated."""
+    """Migrate old string refs to {index, raw} objects and enrich with evidence. Returns True if mutated."""
     mutated = False
     for entry in refs_cache.values():
         refs = entry.get("refs", [])
         if not refs:
             continue
         if isinstance(refs[0], str):
-            entry["refs"] = [{"index": i, "raw": s} for i, s in enumerate(refs)]
+            entry["refs"] = [{"index": i, "raw": s, **_parse_reference(s)} for i, s in enumerate(refs)]
             mutated = True
         elif isinstance(refs[0], dict):
             # repair index only, preserve every other field (paper_id, status, etc.)
@@ -106,6 +148,10 @@ def _migrate_refs_cache(refs_cache: dict) -> bool:
                 for i, r in enumerate(refs):
                     r["index"] = i
                 mutated = True
+            # enrich old {index, raw} refs with deterministic evidence if missing
+            for r in refs:
+                if _enrich_ref_with_evidence(r):
+                    mutated = True
     return mutated
 
 
@@ -323,13 +369,13 @@ def main(argv=None):
         needs_reconciliation = not existing or not existing.get("paper_id")
 
         if existing and not needs_reconciliation:
-            # ensure refs are cached even for skips (backfill/migrate)
+            # ensure refs are cached even for skips (backfill/migrate) — now with evidence
             if h not in refs_cache:
                 ident_tmp = identify_pdf(pdf)
                 rec_tmp = ingest_one(pdf, h, ident_tmp)
                 refs_cache[h] = {
                     "mode": rec_tmp.get("mode"),
-                    "refs": [{"index": i, "raw": s} for i, s in enumerate(rec_tmp.get("refs", []))],
+                    "refs": [{"index": i, "raw": s, **_parse_reference(s)} for i, s in enumerate(rec_tmp.get("refs", []))],
                 }
                 refs_written += 1
                 refs_dirty = True
@@ -337,7 +383,15 @@ def main(argv=None):
                     f"backfill {pdf.name}  {h[:8]}  refs={rec_tmp.get('references',0):3}  mode={rec_tmp.get('mode')}"
                 )
             else:
-                # already in new object format due to _migrate_refs_cache; no rewrite needed
+                # enrich existing refs with deterministic evidence if missing (no rewrite if already enriched)
+                entry = refs_cache[h]
+                enriched = False
+                for r in entry.get("refs", []):
+                    if _enrich_ref_with_evidence(r):
+                        enriched = True
+                if enriched:
+                    refs_dirty = True
+                    refs_written += 1
                 print(
                     f"skip  {pdf.name}  {h[:8]}  already integrated"
                     f"  paper={existing['paper_id']}"
@@ -364,15 +418,25 @@ def main(argv=None):
                     "version": ident.get("version"),
                     "authors": ident.get("authors", []),
                 })
-            # also backfill refs for this reconciled document in new object format
+            # also backfill refs for this reconciled document with evidence
             if h not in refs_cache:
                 rec_tmp = ingest_one(pdf, h, ident)
                 refs_cache[h] = {
                     "mode": rec_tmp.get("mode"),
-                    "refs": [{"index": i, "raw": s} for i, s in enumerate(rec_tmp.get("refs", []))],
+                    "refs": [{"index": i, "raw": s, **_parse_reference(s)} for i, s in enumerate(rec_tmp.get("refs", []))],
                 }
                 refs_written += 1
                 refs_dirty = True
+            else:
+                # enrich existing refs in place
+                entry = refs_cache[h]
+                enriched = False
+                for r in entry.get("refs", []):
+                    if _enrich_ref_with_evidence(r):
+                        enriched = True
+                if enriched:
+                    refs_dirty = True
+                    refs_written += 1
             print(
                 f"recon {pdf.name}  {h[:8]}  paper={paper_id}"
                 f"  via={recon_status}"
@@ -384,10 +448,10 @@ def main(argv=None):
         rec["paper_id"] = paper_id
         rec["reconciliation"] = recon_status
 
-        # cache the split refs as stable per-reference records (index + raw)
+        # cache the split refs as stable per-reference records (index + raw + deterministic evidence)
         refs_cache[h] = {
             "mode": rec.get("mode"),
-            "refs": [{"index": i, "raw": s} for i, s in enumerate(rec.get("refs", []))],
+            "refs": [{"index": i, "raw": s, **_parse_reference(s)} for i, s in enumerate(rec.get("refs", []))],
         }
         refs_written += 1
         refs_dirty = True
