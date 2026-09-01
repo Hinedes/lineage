@@ -9,6 +9,7 @@ from ingest import (
     _migrate_papers_cache,
     _migrate_refs_cache,
     _parse_reference,
+    _prune_orphan_papers,
     _resolve_ref,
 )
 from reconcile import make_evidence, reconcile_document
@@ -383,6 +384,9 @@ class RefEvidenceTests(unittest.TestCase):
         paper_id, via, changed = _resolve_ref(papers, ref)
         self.assertTrue(changed)
         self.assertEqual((paper_id, via), ("arxiv:2222.22222", "arxiv"))
+        self.assertEqual(_prune_orphan_papers(papers, cache, manifest), ["arxiv:1111.11111"])
+        self.assertNotIn("arxiv:1111.11111", papers)
+        self.assertIn("arxiv:2222.22222", papers)
         self.assertEqual(_build_current_edges(cache, manifest, papers), {(source, "arxiv:2222.22222")})
 
     def test_equivalent_doi_normalization_preserves_resolution(self):
@@ -455,6 +459,59 @@ class RefEvidenceTests(unittest.TestCase):
         self.assertIsNone(_resolve_ref(papers, ref)[0])
         self.assertTrue(all(field not in ref for field in ("paper_id", "status", "resolved_via")))
         self.assertEqual(_build_current_edges(cache, manifest, papers), set())
+
+    def test_orphan_paper_stays_when_another_ref_still_cites_it(self):
+        old_target = "arxiv:1111.11111"
+        source = "arxiv:0000.00000"
+        cache = {
+            "doc": {
+                "refs": [
+                    {"arxiv": "2222.22222", "paper_id": "arxiv:2222.22222", "status": "resolved"},
+                    {"arxiv": "1111.11111", "paper_id": old_target, "status": "resolved"},
+                ]
+            }
+        }
+        papers = {
+            source: _paper(source, arxiv="0000.00000"),
+            old_target: _paper(old_target, arxiv="1111.11111"),
+            "arxiv:2222.22222": _paper("arxiv:2222.22222", arxiv="2222.22222"),
+        }
+
+        self.assertEqual(_prune_orphan_papers(papers, cache, {"doc": {"paper_id": source}}), [])
+        self.assertIn(old_target, papers)
+
+    def test_orphan_paper_stays_when_document_backed(self):
+        paper_id = "arxiv:1111.11111"
+        papers = {paper_id: _paper(paper_id, arxiv="1111.11111")}
+        papers[paper_id]["documents"] = ["d" * 64]
+
+        self.assertEqual(_prune_orphan_papers(papers, {}, {}), [])
+        self.assertIn(paper_id, papers)
+
+    def test_orphan_paper_stays_when_it_is_a_manifest_source(self):
+        paper_id = "arxiv:1111.11111"
+        papers = {paper_id: _paper(paper_id, arxiv="1111.11111")}
+
+        self.assertEqual(
+            _prune_orphan_papers(papers, {}, {"doc": {"paper_id": paper_id}}),
+            [],
+        )
+        self.assertIn(paper_id, papers)
+
+    def test_orphan_paper_stays_when_required_by_reconciliation_conflict(self):
+        candidate = "arxiv:1111.11111"
+        conflict = "paper:conflict"
+        papers = {
+            candidate: _paper(candidate, arxiv="1111.11111"),
+            conflict: {
+                **_paper(conflict),
+                "documents": ["d" * 64],
+                "reconciliation_conflict": [candidate],
+            },
+        }
+
+        self.assertEqual(_prune_orphan_papers(papers, {}, {}), [])
+        self.assertIn(candidate, papers)
 
     def test_second_migration_and_resolution_are_state_idempotent(self):
         raw = "A paper. doi:10.1234/ABC."

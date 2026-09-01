@@ -613,6 +613,40 @@ def _build_current_edges(refs_cache: dict, manifest: dict, papers: dict) -> set[
     return edge_set
 
 
+def _prune_orphan_papers(papers: dict, refs_cache: dict, manifest: dict) -> list[str]:
+    """Remove only empty-document papers with no current or document-backed dependents."""
+    referenced = {
+        ref.get("paper_id")
+        for entry in refs_cache.values()
+        for ref in entry.get("refs", [])
+        if ref.get("status") == "resolved" and ref.get("paper_id")
+    }
+    protected = referenced | {
+        entry.get("paper_id")
+        for entry in manifest.values()
+        if entry.get("paper_id")
+    }
+    for paper_id, paper in papers.items():
+        if not isinstance(paper, dict):
+            continue
+        if paper.get("documents") or "reconciliation_conflict" in paper:
+            protected.add(paper_id)
+        protected.update(
+            candidate
+            for candidate in paper.get("reconciliation_conflict", [])
+            if isinstance(candidate, str)
+        )
+
+    removed = [
+        paper_id
+        for paper_id, paper in papers.items()
+        if isinstance(paper, dict) and paper.get("documents") == [] and paper_id not in protected
+    ]
+    for paper_id in removed:
+        del papers[paper_id]
+    return removed
+
+
 def identify_pdf(pdf: Path) -> dict:
     """Read paper identity evidence from the PDF, using filename only as fallback."""
     name = pdf.name
@@ -984,6 +1018,7 @@ def main(argv=None):
         refs_resolved = arxiv_resolved + doi_resolved
         refs_unresolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("status") != "resolved")
     # graph.json is a cache; citation edges come only from current resolved refs.
+    pruned_papers = _prune_orphan_papers(papers, refs_cache, manifest)
     edge_set = _build_current_edges(refs_cache, manifest, papers)
     # rebuild graph: nodes are papers (not documents), edges are deduplicated citations
     # deterministically sort for idempotency
@@ -1007,7 +1042,7 @@ def main(argv=None):
     manifest_dirty = new_cnt > 0 or reconcile_cnt > 0
     if manifest_dirty:
         save_json(MANIFEST, manifest)
-    papers_dirty = papers_migrated or len(papers) != papers_before or refs_resolve_dirty
+    papers_dirty = papers_migrated or len(papers) != papers_before or refs_resolve_dirty or bool(pruned_papers)
     if papers_dirty:
         save_json(PAPERS, papers)
     if graph_dirty:
