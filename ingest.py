@@ -47,9 +47,47 @@ ARXIV_STAMP = re.compile(r"arXiv:\s*(\d{4}\.\d{4,5})(v\d+)\s*\[([^\]]+)\]\s*(\d+
 ARXIV_DATE = re.compile(r"(\d{2})(\d{2})\.\d+")
 YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 _YEAR_TOKEN = r"(?:19|20)\d{2}[a-z]?"
-_PREFIX_YEAR_RE = re.compile(
-    rf"^(?P<authors>.+?)(?:\s*[.,]\s*|\s+\(\s*){_YEAR_TOKEN}\s*\)?\s*[.:,]?\s+(?P<rest>.+)$",
+_YEAR_CANDIDATE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?P<year>(?:19|20)\d{2})(?:[a-z])?(?![A-Za-z0-9])", re.I
+)
+_DOI_ID_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", re.I)
+_ARXIV_ID_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:\d{4}\.\d{4,5}|[a-z][a-z0-9.-]+/\d{7})(?:v\d+)?(?![A-Za-z0-9])",
     re.I,
+)
+_URL_RE = re.compile(r"(?:https?\s*:\s*/\s*/\s*|www\.)\S+", re.I)
+_URL_PATH_YEAR_RE = re.compile(
+    r"(?:https?\s*:\s*/\s*/\s*|www\.)[^\s]*?/\s*(?:19|20)\d{2}(?:[a-z])?",
+    re.I,
+)
+_PREFIX_YEAR_RE = re.compile(
+    rf"^(?P<authors>.+?)(?:\s*[.,]\s*|\s+\(\s*)(?P<year>{_YEAR_TOKEN})\s*\)?\s*[.:,]?\s+(?P<rest>.+)$",
+    re.I,
+)
+_MONTH_TOKEN = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+_MONTH_BEFORE_YEAR_RE = re.compile(rf"\b{_MONTH_TOKEN}\s+$", re.I)
+_NUMERIC_MONTH_BEFORE_YEAR_RE = re.compile(r"\b(?:0?[1-9]|1[0-2])\s+$")
+_NUMBER_LABEL_RE = re.compile(
+    r"\b(?:page|pages|pp|volume|vol|issue|article|no)\.?\s*[,;:]?\s*(?:\(\s*)?$",
+    re.I,
+)
+_VENUE_ACRONYM_RE = re.compile(
+    r"\b(?:aaai|acl|acm|cvpr|eccv|emnlp|iclr|icml|ijcai|isca|lrec|naacl|neurips|nips|"
+    r"sigkdd|siam|uai)(?:-[A-Za-z0-9]+)*-?\s*$",
+    re.I,
+)
+_VENUE_YEAR_PREFIX_RE = re.compile(
+    r"\b(?:proceedings(?:\s+of(?:\s+the)?)?|annual\s+meeting\s+of|"
+    r"conference\s+(?:on|of)|workshop\s+(?:on|of)|symposium\s+(?:on|of))\s*$",
+    re.I,
+)
+_CONFERENCE_AFTER_YEAR_RE = re.compile(
+    r"\s+(?:(?:the|of|annual|ieee|acm|[A-Za-z][A-Za-z0-9-]*)\s+){0,3}"
+    r"(?:conference|workshop|symposium|meeting|confer-\s*ence)\b",
+    re.I,
+)
+_PUBLICATION_YEAR_PREFIX_RE = re.compile(
+    r"\b(?:published|publication\s+date|copyright)\s+(?:in\s+|date\s*:\s*)$", re.I
 )
 _NAME_TOKEN_RE = re.compile(r"[^\W\d_]+(?:[-'’][^\W\d_]+)*\.?", re.UNICODE)
 _NAME_PARTICLES = {"al", "bin", "da", "de", "del", "den", "der", "di", "du", "la", "le", "st", "ten", "van", "von"}
@@ -82,7 +120,7 @@ _VENUE_PREFIX = (
     r"american\s+mathematical\s+society|springer|nature|neurips|icml|iclr|cvpr|"
     r"acl|emnlp|distill|dokl|commun|sn)"
 )
-REF_EVIDENCE_VERSION = 3
+REF_EVIDENCE_VERSION = 5
 DERIVED_EVIDENCE_FIELDS = (
     "doi", "arxiv", "arxiv_version", "year", "title", "title_norm", "authors", "authors_norm",
     "authors_complete",
@@ -362,6 +400,77 @@ def _title_author_evidence(raw: str) -> dict:
     return {}
 
 
+def _mask_year_exclusions(raw: str) -> str:
+    masked = list(raw or "")
+    for pattern in (_URL_RE, _URL_PATH_YEAR_RE, _DOI_ID_RE, _ARXIV_ID_RE):
+        for match in pattern.finditer(raw or ""):
+            for index in range(*match.span()):
+                masked[index] = " "
+    return "".join(masked)
+
+
+def _extract_publication_year(raw: str) -> str | None:
+    text = raw or ""
+    masked = re.sub(r"\s+", " ", _mask_year_exclusions(text)).strip()
+    prefix = _PREFIX_YEAR_RE.match(masked)
+    prefix_year_span = (
+        prefix.span("year")
+        if prefix and len(prefix.group("authors")) <= 320
+        else None
+    )
+    candidates = []
+    for match in _YEAR_CANDIDATE_RE.finditer(masked):
+        start, end = match.span()
+        left, right = masked[:start], masked[end:]
+        if (
+            re.search(r"\s*[-\u2010\u2011\u2012\u2013\u2014]\s*$", left)
+            or re.match(r"\s*[-\u2010\u2011\u2012\u2013\u2014]", right)
+        ) and not (_VENUE_ACRONYM_RE.search(left) and re.match(r"\s*[.,;:)]|$", right)):
+            continue
+        if _NUMBER_LABEL_RE.search(left):
+            continue
+        if re.search(r"\bpublished\s+as\s+a\s+conference\s+paper\s+at\b", left[-120:], re.I):
+            continue
+
+        year = match.group("year")
+        score = 0
+        if prefix_year_span == (start, end):
+            score = 1200
+        elif re.search(r"\(\s*$", left) and re.match(r"\s*\)", right):
+            score = 1100
+        elif _MONTH_BEFORE_YEAR_RE.search(left) or _NUMERIC_MONTH_BEFORE_YEAR_RE.search(left):
+            score = 1000
+        elif _PUBLICATION_YEAR_PREFIX_RE.search(left):
+            score = 950
+        elif start == 0 and re.match(r"\s*[.:,)]", right):
+            score = 900
+        elif re.match(r"\s*[.,:]\s*\d{1,5}\s*[-\u2010\u2011\u2012\u2013\u2014]\s*\d{1,5}", right):
+            score = 850
+        elif (
+            (_VENUE_ACRONYM_RE.search(left) and re.match(r"\s*[.,:)]|$", right))
+            or (
+                _VENUE_YEAR_PREFIX_RE.search(left)
+                and _CONFERENCE_AFTER_YEAR_RE.match(right)
+            )
+            or (
+                re.search(r"\b(?:in|at)(?:\s+the)?\s*$", left, re.I)
+                and _CONFERENCE_AFTER_YEAR_RE.match(right)
+            )
+        ):
+            score = 800
+        elif re.search(r"[.,;:]\s*$", left) and re.match(r"\s*(?:[.,;:)]|$)", right):
+            score = 750
+        elif not right.strip():
+            score = 600
+        if score:
+            candidates.append((score, year))
+    if not candidates:
+        return None
+    best_score = max(score for score, _ in candidates)
+    best_years = {year for score, year in candidates if score == best_score}
+    return next(iter(best_years)) if len(best_years) == 1 else None
+
+
 def _parse_reference(raw: str) -> dict:
     """Deterministic evidence from a raw split reference — no resolution, no network."""
     doi = extract_doi(raw)
@@ -372,10 +481,7 @@ def _parse_reference(raw: str) -> dict:
         m = re.search(r"\b(\d{4}\.\d{4,5})(v\d+)?\b", raw)
         if m:
             arxiv_base, arxiv_version = normalize_arxiv(m.group(0))
-    year = None
-    ym = YEAR_RE.search(raw)
-    if ym:
-        year = ym.group(0)
+    year = _extract_publication_year(raw)
     out = {}
     if doi:
         out["doi"] = doi

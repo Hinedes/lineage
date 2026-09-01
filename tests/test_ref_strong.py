@@ -327,6 +327,48 @@ class RefEvidenceTests(unittest.TestCase):
                 ref = _parse_reference(raw)
                 self.assertEqual(ref["title"], expected_title)
 
+    def test_publication_year_ignores_identifier_digits_and_keeps_suffix_base(self):
+        cases = (
+            (
+                "Exploring the limits of transfer learning with a unified text-to-text transformer. "
+                "ArXiv, abs/1910.10683, 2020.",
+                "2020",
+            ),
+            ("Natural adversarial examples ... arXiv:1907.07174, 2019.", "2019"),
+            ("arXiv:2104.08691, 2021", "2021"),
+            ("(2020). Title...", "2020"),
+            ("2020c. Title...", "2020"),
+            ("A title. In Proceedings of the 2020 Conference on Tests.", "2020"),
+            ("A title. New York, USA, July 2008. Association.", "2008"),
+            ("A title. pages 1950-1965, 2022.", "2022"),
+            ("A title. LREC-2014, pages 216-223.", "2014"),
+            ("A title. In NIPS 2017.", "2017"),
+            ("A title. In the 2020 Conference on Tests.", "2020"),
+            ("A title. Published in 2020.", "2020"),
+        )
+        for raw, expected_year in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(_parse_reference(raw).get("year"), expected_year)
+
+    def test_publication_year_is_absent_without_explicit_bibliographic_year(self):
+        self.assertNotIn("year", _parse_reference("citation only arXiv:1910.10683"))
+
+    def test_doi_year_like_digits_are_not_publication_year(self):
+        ref = _parse_reference("A paper. doi:10.2020/12345")
+
+        self.assertEqual(ref["doi"], "10.2020/12345")
+        self.assertNotIn("year", ref)
+
+    def test_publication_year_rejects_page_volume_and_footer_numbers(self):
+        for raw in (
+            "A title. volume 2024, pages 54107-54157.",
+            "Published as a conference paper at ICLR 2024",
+            "A paper. URL https: //example.org/2018/10/title",
+            "A paper. URL https://example.org/\n2018/title",
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotIn("year", _parse_reference(raw))
+
     def test_enrichment_preserves_resolution_when_strong_evidence_is_unchanged(self):
         raw = "John Smith and Alice Doe. A title: GPT-4, R&D, 3D. arXiv:2101.12345v2, 2021. doi:10.1234/parsed"
         ref = {
@@ -351,6 +393,26 @@ class RefEvidenceTests(unittest.TestCase):
         self.assertEqual(ref["resolved_via"], "arxiv")
         self.assertEqual(ref["evidence_version"], REF_EVIDENCE_VERSION)
         self.assertFalse(_enrich_ref_with_evidence(ref))
+
+    def test_year_migration_refreshes_metadata_and_preserves_strong_resolution(self):
+        raw = "Exploring the limits of transfer learning. ArXiv, abs/1910.10683, 2020."
+        ref = {
+            "index": 2,
+            "raw": raw,
+            "arxiv": "1910.10683",
+            "year": "1910",
+            "paper_id": "arxiv:1910.10683",
+            "status": "resolved",
+            "resolved_via": "arxiv",
+            "evidence_version": REF_EVIDENCE_VERSION - 1,
+        }
+
+        self.assertTrue(_enrich_ref_with_evidence(ref))
+        self.assertEqual(ref["raw"], raw)
+        self.assertEqual(ref["year"], "2020")
+        self.assertEqual(ref["paper_id"], "arxiv:1910.10683")
+        self.assertEqual(ref["status"], "resolved")
+        self.assertEqual(ref["resolved_via"], "arxiv")
 
     def test_changed_arxiv_invalidates_resolution_and_rebuilds_only_current_edge(self):
         raw = "Some paper arXiv:2222.22222"
