@@ -2,8 +2,10 @@ import json
 import unittest
 
 from ingest import (
+    TITLE_AUTHORS_ANCHOR_VIA,
     REF_EVIDENCE_VERSION,
     _build_current_edges,
+    _build_strong_id_anchor_set,
     _enrich_ref_with_evidence,
     _get_or_create_paper_for_ref,
     _migrate_papers_cache,
@@ -11,6 +13,7 @@ from ingest import (
     _parse_reference,
     _prune_orphan_papers,
     _resolve_ref,
+    _resolve_title_authors_anchor,
 )
 from reconcile import make_evidence, reconcile_document
 
@@ -25,6 +28,31 @@ def _paper(paper_id, *, doi=None, arxiv=None):
         "authors": [],
         "authors_norm": [],
         "documents": [],
+    }
+
+
+def _anchor_ref(paper_id, arxiv, *, title_norm="target title", authors_norm=None):
+    return {
+        "index": 0,
+        "raw": "anchor",
+        "evidence_version": REF_EVIDENCE_VERSION,
+        "arxiv": arxiv,
+        "title_norm": title_norm,
+        "authors_norm": authors_norm or [{"given": "j", "initial": "j", "surname": "smith"}],
+        "authors_complete": True,
+        "paper_id": paper_id,
+        "status": "resolved",
+        "resolved_via": "arxiv",
+    }
+
+
+def _fallback_ref(*, title_norm="target title", authors_norm=None, complete=True):
+    return {
+        "index": 1,
+        "raw": "candidate",
+        "title_norm": title_norm,
+        "authors_norm": authors_norm or [{"given": "john", "initial": "j", "surname": "smith"}],
+        "authors_complete": complete,
     }
 
 
@@ -667,6 +695,255 @@ class RefEvidenceTests(unittest.TestCase):
         ref = cache["doc"]["refs"][0]
         self.assertEqual({key: ref[key] for key in stable}, stable)
         self.assertNotEqual(ref["title"], "stale")
+
+
+class AnchoredResolutionTests(unittest.TestCase):
+    def test_exact_complete_title_authors_resolve_to_one_anchor(self):
+        target = "arxiv:2401.12345"
+        authors = [{"given": "john", "initial": "j", "surname": "smith"}]
+        anchor = _anchor_ref(target, "2401.12345", authors_norm=authors)
+        ref = _fallback_ref(authors_norm=authors)
+        papers = {target: _paper(target, arxiv="2401.12345")}
+
+        pid, changed, count = _resolve_title_authors_anchor(
+            ref, _build_strong_id_anchor_set({"doc": {"refs": [anchor]}}, papers)
+        )
+
+        self.assertEqual((pid, count), (target, 1))
+        self.assertTrue(changed)
+        self.assertEqual(ref["resolved_via"], TITLE_AUTHORS_ANCHOR_VIA)
+
+    def test_duplicate_anchor_refs_for_one_paper_remain_one_candidate(self):
+        target = "arxiv:2401.12345"
+        authors = [{"given": "john", "initial": "j", "surname": "smith"}]
+        cache = {
+            "doc": {
+                "refs": [
+                    _anchor_ref(target, "2401.12345", authors_norm=authors),
+                    _anchor_ref(target, "2401.12345", authors_norm=authors),
+                ]
+            }
+        }
+        papers = {target: _paper(target, arxiv="2401.12345")}
+        ref = _fallback_ref(authors_norm=authors)
+
+        pid, _, count = _resolve_title_authors_anchor(ref, _build_strong_id_anchor_set(cache, papers))
+
+        self.assertEqual((pid, count), (target, 1))
+
+    def test_anchors_for_two_papers_remain_ambiguous(self):
+        authors = [{"given": "john", "initial": "j", "surname": "smith"}]
+        p1, p2 = "arxiv:2401.12345", "arxiv:2401.12346"
+        cache = {
+            "doc": {
+                "refs": [
+                    _anchor_ref(p1, "2401.12345", authors_norm=authors),
+                    _anchor_ref(p2, "2401.12346", authors_norm=authors),
+                ]
+            }
+        }
+        papers = {p1: _paper(p1, arxiv="2401.12345"), p2: _paper(p2, arxiv="2401.12346")}
+        ref = _fallback_ref(authors_norm=authors)
+
+        pid, changed, count = _resolve_title_authors_anchor(ref, _build_strong_id_anchor_set(cache, papers))
+
+        self.assertEqual((pid, changed, count), (None, False, 2))
+        self.assertNotIn("paper_id", ref)
+
+    def test_incompatible_authors_do_not_match(self):
+        target = "arxiv:2401.12345"
+        anchor = _anchor_ref(target, "2401.12345")
+        ref = _fallback_ref(authors_norm=[{"given": "a", "initial": "a", "surname": "jones"}])
+        papers = {target: _paper(target, arxiv="2401.12345")}
+
+        pid, changed, count = _resolve_title_authors_anchor(
+            ref, _build_strong_id_anchor_set({"doc": {"refs": [anchor]}}, papers)
+        )
+
+        self.assertEqual((pid, changed, count), (None, False, 0))
+
+    def test_different_title_does_not_match(self):
+        target = "arxiv:2401.12345"
+        anchor = _anchor_ref(target, "2401.12345", title_norm="other title")
+        ref = _fallback_ref(title_norm="target title")
+        papers = {target: _paper(target, arxiv="2401.12345")}
+
+        pid, changed, count = _resolve_title_authors_anchor(
+            ref, _build_strong_id_anchor_set({"doc": {"refs": [anchor]}}, papers)
+        )
+
+        self.assertEqual((pid, changed, count), (None, False, 0))
+
+    def test_incomplete_authors_do_not_attempt_fallback(self):
+        target = "arxiv:2401.12345"
+        anchor = _anchor_ref(target, "2401.12345")
+        ref = _fallback_ref(complete=False)
+        papers = {target: _paper(target, arxiv="2401.12345")}
+
+        pid, changed, count = _resolve_title_authors_anchor(
+            ref, _build_strong_id_anchor_set({"doc": {"refs": [anchor]}}, papers)
+        )
+
+        self.assertEqual((pid, changed, count), (None, False, 0))
+        self.assertNotIn("paper_id", ref)
+
+    def test_initial_and_full_name_authors_are_compatible(self):
+        target = "arxiv:2401.12345"
+        anchor = _anchor_ref(target, "2401.12345")
+        ref = _fallback_ref()
+        papers = {target: _paper(target, arxiv="2401.12345")}
+
+        pid, _, count = _resolve_title_authors_anchor(
+            ref, _build_strong_id_anchor_set({"doc": {"refs": [anchor]}}, papers)
+        )
+
+        self.assertEqual((pid, count), (target, 1))
+
+    def test_evidence_migration_clears_and_recomputes_fallback_resolution(self):
+        target = "arxiv:2401.12345"
+        new_authors = [
+            {"given": "john", "initial": "j", "surname": "smith"},
+            {"given": "alice", "initial": "a", "surname": "doe"},
+        ]
+        old_authors = [
+            {"given": "john", "initial": "j", "surname": "smith"},
+            {"given": "bob", "initial": "b", "surname": "doe"},
+        ]
+        anchor = _anchor_ref(target, "2401.12345", title_norm="new title", authors_norm=new_authors)
+        ref = {
+            **_fallback_ref(title_norm="old title", authors_norm=old_authors),
+            "raw": "John Smith and Alice Doe. New title. 2024.",
+            "paper_id": target,
+            "status": "resolved",
+            "resolved_via": TITLE_AUTHORS_ANCHOR_VIA,
+            "evidence_version": REF_EVIDENCE_VERSION - 1,
+        }
+        cache = {"anchor": {"refs": [anchor]}, "candidate": {"refs": [ref]}}
+        papers = {target: _paper(target, arxiv="2401.12345")}
+
+        self.assertTrue(_migrate_refs_cache(cache))
+        self.assertNotIn("paper_id", ref)
+        self.assertEqual(ref["title_norm"], "new title")
+        self.assertEqual(ref["authors_norm"], new_authors)
+
+        pid, changed, count = _resolve_title_authors_anchor(
+            ref, _build_strong_id_anchor_set(cache, papers)
+        )
+        self.assertEqual((pid, count), (target, 1))
+        self.assertTrue(changed)
+
+    def test_disappearing_anchor_clears_cached_fallback_resolution(self):
+        target = "arxiv:2401.12345"
+        anchor = _anchor_ref(target, "2401.12345")
+        ref = _fallback_ref()
+        cache = {"doc": {"refs": [anchor, ref]}}
+        papers = {target: _paper(target, arxiv="2401.12345")}
+
+        anchors = _build_strong_id_anchor_set(cache, papers)
+        self.assertEqual(_resolve_title_authors_anchor(ref, anchors)[0], target)
+        anchor["status"] = "unresolved"
+
+        pid, changed, count = _resolve_title_authors_anchor(
+            ref, _build_strong_id_anchor_set(cache, papers)
+        )
+
+        self.assertEqual((pid, count), (None, 0))
+        self.assertTrue(changed)
+        self.assertNotIn("paper_id", ref)
+
+    def test_fallback_does_not_create_a_paper(self):
+        target = "arxiv:2401.12345"
+        papers = {target: _paper(target, arxiv="2401.12345")}
+        anchor = _anchor_ref(target, "2401.12345")
+        ref = _fallback_ref()
+
+        _resolve_title_authors_anchor(ref, _build_strong_id_anchor_set({"doc": {"refs": [anchor]}}, papers))
+
+        self.assertEqual(len(papers), 1)
+
+    def test_unanchored_paper_metadata_is_ignored(self):
+        target = "arxiv:2401.12345"
+        papers = {target: _paper(target, arxiv="2401.12345")}
+        papers[target].update(
+            {
+                "title_norm": "target title",
+                "authors_norm": [{"given": "j", "initial": "j", "surname": "smith"}],
+            }
+        )
+        ref = _fallback_ref()
+
+        pid, changed, count = _resolve_title_authors_anchor(ref, {})
+
+        self.assertEqual((pid, changed, count), (None, False, 0))
+        self.assertEqual(len(papers), 1)
+
+    def test_strong_id_conflict_does_not_fall_back_to_an_anchor(self):
+        conflict_arxiv = "arxiv:2401.12345"
+        conflict_doi = "doi:10.1234/conflict"
+        anchor_id = "arxiv:2401.12346"
+        ref = {
+            "doi": "10.1234/conflict",
+            "arxiv": "2401.12345",
+            "title_norm": "target title",
+            "authors_norm": [{"given": "j", "initial": "j", "surname": "smith"}],
+            "authors_complete": True,
+            "paper_id": conflict_arxiv,
+            "status": "resolved",
+            "resolved_via": "arxiv",
+        }
+        papers = {
+            conflict_arxiv: _paper(conflict_arxiv, arxiv="2401.12345"),
+            conflict_doi: _paper(conflict_doi, doi="10.1234/conflict"),
+            anchor_id: _paper(anchor_id, arxiv="2401.12346"),
+        }
+        anchors = _build_strong_id_anchor_set(
+            {"doc": {"refs": [_anchor_ref(anchor_id, "2401.12346")]}}, papers
+        )
+
+        self.assertIsNone(_resolve_ref(papers, ref)[0])
+        pid, changed, count = _resolve_title_authors_anchor(ref, anchors)
+
+        self.assertEqual((pid, changed, count), (None, False, 0))
+        self.assertNotIn("paper_id", ref)
+
+    def test_cached_strong_resolution_rejects_target_identifier_conflict(self):
+        target = "arxiv:2401.12345"
+        ref = {
+            "doi": "10.1234/current",
+            "arxiv": "2401.12345",
+            "paper_id": target,
+            "status": "resolved",
+            "resolved_via": "arxiv",
+        }
+        papers = {target: _paper(target, arxiv="2401.12345", doi="10.1234/other")}
+
+        pid, via, changed = _resolve_ref(papers, ref)
+
+        self.assertEqual((pid, via), (None, None))
+        self.assertTrue(changed)
+        self.assertNotIn("paper_id", ref)
+
+    def test_fallback_edges_follow_current_anchor_resolution(self):
+        source = "arxiv:0000.00000"
+        target = "arxiv:2401.12345"
+        anchor = _anchor_ref(target, "2401.12345")
+        fallback = _fallback_ref()
+        cache = {"doc": {"refs": [anchor, fallback]}}
+        papers = {
+            source: _paper(source, arxiv="0000.00000"),
+            target: _paper(target, arxiv="2401.12345"),
+        }
+        manifest = {"doc": {"paper_id": source}}
+
+        anchors = _build_strong_id_anchor_set(cache, papers)
+        self.assertEqual(_resolve_title_authors_anchor(fallback, anchors)[0], target)
+        self.assertEqual(_build_current_edges(cache, manifest, papers), {(source, target)})
+
+        anchor["status"] = "unresolved"
+        self.assertIsNone(
+            _resolve_title_authors_anchor(fallback, _build_strong_id_anchor_set(cache, papers))[0]
+        )
+        self.assertEqual(_build_current_edges(cache, manifest, papers), set())
 
 
 if __name__ == "__main__":

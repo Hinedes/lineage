@@ -28,6 +28,7 @@ from pypdf import PdfReader
 
 import bib_extract
 from reconcile import (
+    authors_compatible,
     extract_arxiv,
     extract_authors_from_front_page,
     extract_doi,
@@ -126,6 +127,8 @@ DERIVED_EVIDENCE_FIELDS = (
     "authors_complete",
 )
 RESOLUTION_FIELDS = ("paper_id", "status", "resolved_via")
+STRONG_RESOLUTION_VIAS = frozenset(("arxiv", "doi"))
+TITLE_AUTHORS_ANCHOR_VIA = "title_authors_anchor"
 
 CACHE_DIR = Path(".cache")
 MANIFEST = CACHE_DIR / "lineage2.json"
@@ -505,6 +508,11 @@ def _normalized_strong_evidence(ref: dict) -> tuple[str | None, str | None]:
     return doi, arxiv
 
 
+def _has_strong_evidence(ref: dict) -> bool:
+    doi, arxiv = _normalized_strong_evidence(ref)
+    return bool(doi or arxiv)
+
+
 def _clear_ref_resolution(ref: dict) -> bool:
     changed = False
     for field in RESOLUTION_FIELDS:
@@ -515,17 +523,18 @@ def _clear_ref_resolution(ref: dict) -> bool:
 
 
 def _enrich_ref_with_evidence(ref: dict) -> bool:
-    """Refresh derived evidence, invalidating resolution only when strong IDs change."""
+    """Refresh derived evidence, invalidating resolution when its evidence requires it."""
     if ref.get("evidence_version") == REF_EVIDENCE_VERSION:
         return False
     old_strong = _normalized_strong_evidence(ref)
+    had_title_authors_resolution = ref.get("resolved_via") == TITLE_AUTHORS_ANCHOR_VIA
     raw = ref.get("raw", "")
     for field in DERIVED_EVIDENCE_FIELDS:
         ref.pop(field, None)
     parsed = _parse_reference(raw)
     ref.update(parsed)
     ref["evidence_version"] = REF_EVIDENCE_VERSION
-    if old_strong != _normalized_strong_evidence(ref):
+    if old_strong != _normalized_strong_evidence(ref) or had_title_authors_resolution:
         _clear_ref_resolution(ref)
     return True
 
@@ -541,7 +550,7 @@ def _migrate_refs_cache(refs_cache: dict) -> bool:
             entry["refs"] = [_new_ref(i, s) for i, s in enumerate(refs)]
             mutated = True
         elif isinstance(refs[0], dict):
-            # preserve index/raw and unchanged resolution fields while refreshing evidence
+            # preserve index/raw and strong resolution when valid; fallback is revalidated later
             for r in refs:
                 if _enrich_ref_with_evidence(r):
                     mutated = True
@@ -679,12 +688,83 @@ def _strong_evidence_matches_paper(ref: dict, paper: dict) -> bool:
     return bool((doi_norm and paper_doi == doi_norm) or (arxiv_base and paper_arxiv == arxiv_base))
 
 
-def _resolve_ref(papers: dict, ref: dict) -> tuple[str | None, str | None, bool]:
-    """Resolve one ref, invalidating stale cached linkage before using current evidence."""
+def _is_current_strong_resolution(ref: dict, papers: dict) -> bool:
     paper_id = ref.get("paper_id")
-    if ref.get("status") == "resolved" and paper_id in papers:
-        if _strong_evidence_matches_paper(ref, papers[paper_id]):
-            return paper_id, ref.get("resolved_via"), False
+    if not (
+        ref.get("status") == "resolved"
+        and ref.get("resolved_via") in STRONG_RESOLUTION_VIAS
+        and paper_id in papers
+    ):
+        return False
+    doi_norm, arxiv_base = _normalized_strong_evidence(ref)
+    matches = _find_strong_matches(papers, doi_norm, arxiv_base)
+    return (
+        len(matches) == 1
+        and paper_id in matches
+        and _strong_evidence_matches_paper(ref, papers[paper_id])
+    )
+
+
+def _has_complete_title_author_evidence(ref: dict) -> bool:
+    return bool(ref.get("title_norm") and ref.get("authors_norm") and ref.get("authors_complete") is True)
+
+
+def _build_strong_id_anchor_set(refs_cache: dict, papers: dict) -> dict[str, list[dict]]:
+    anchors: dict[str, list[dict]] = {}
+    for entry in refs_cache.values():
+        for ref in entry.get("refs", []):
+            if _is_current_strong_resolution(ref, papers) and _has_complete_title_author_evidence(ref):
+                anchors.setdefault(ref["paper_id"], []).append(ref)
+    return anchors
+
+
+def _title_authors_anchor_candidates(ref: dict, anchors: dict[str, list[dict]]) -> set[str]:
+    if not _has_complete_title_author_evidence(ref):
+        return set()
+    return {
+        paper_id
+        for paper_id, anchor_refs in anchors.items()
+        if any(
+            anchor.get("title_norm") == ref.get("title_norm")
+            and authors_compatible(anchor.get("authors_norm", []), ref.get("authors_norm", []))
+            for anchor in anchor_refs
+        )
+    }
+
+
+def _resolve_title_authors_anchor(ref: dict, anchors: dict[str, list[dict]]) -> tuple[str | None, bool, int]:
+    if _has_strong_evidence(ref):
+        changed = _clear_ref_resolution(ref) if ref.get("resolved_via") == TITLE_AUTHORS_ANCHOR_VIA else False
+        return None, changed, 0
+    candidates = _title_authors_anchor_candidates(ref, anchors)
+    if len(candidates) != 1:
+        changed = _clear_ref_resolution(ref) if ref.get("resolved_via") == TITLE_AUTHORS_ANCHOR_VIA else False
+        return None, changed, len(candidates)
+
+    paper_id = next(iter(candidates))
+    changed = False
+    if ref.get("paper_id") != paper_id:
+        ref["paper_id"] = paper_id
+        changed = True
+    if ref.get("status") != "resolved":
+        ref["status"] = "resolved"
+        changed = True
+    if ref.get("resolved_via") != TITLE_AUTHORS_ANCHOR_VIA:
+        ref["resolved_via"] = TITLE_AUTHORS_ANCHOR_VIA
+        changed = True
+    return paper_id, changed, 1
+
+
+def _resolve_ref(papers: dict, ref: dict) -> tuple[str | None, str | None, bool]:
+    """Resolve one strong-ID ref, leaving anchored fallback refs for the next pass."""
+    if (
+        ref.get("resolved_via") == TITLE_AUTHORS_ANCHOR_VIA
+        and not _has_strong_evidence(ref)
+    ):
+        return ref.get("paper_id"), TITLE_AUTHORS_ANCHOR_VIA, False
+
+    if _is_current_strong_resolution(ref, papers):
+        return ref.get("paper_id"), ref.get("resolved_via"), False
 
     changed = _clear_ref_resolution(ref)
     paper_id, via = _get_or_create_paper_for_ref(papers, ref)
@@ -699,8 +779,9 @@ def _resolve_ref(papers: dict, ref: dict) -> tuple[str | None, str | None, bool]
 
 
 def _build_current_edges(refs_cache: dict, manifest: dict, papers: dict) -> set[tuple[str, str]]:
-    """Build citation edges solely from refs resolved against current paper evidence."""
+    """Build citation edges solely from current strong or anchored resolutions."""
     edge_set = set()
+    anchors = _build_strong_id_anchor_set(refs_cache, papers)
     for doc_sha, entry in refs_cache.items():
         manifest_entry = manifest.get(doc_sha)
         if not manifest_entry or not manifest_entry.get("paper_id"):
@@ -710,11 +791,17 @@ def _build_current_edges(refs_cache: dict, manifest: dict, papers: dict) -> set[
             continue
         for ref in entry.get("refs", []):
             target = ref.get("paper_id")
-            if (
-                ref.get("status") == "resolved"
-                and target in papers
-                and _strong_evidence_matches_paper(ref, papers[target])
-            ):
+            if ref.get("status") != "resolved" or target not in papers:
+                continue
+            via = ref.get("resolved_via")
+            if via in STRONG_RESOLUTION_VIAS:
+                valid = _is_current_strong_resolution(ref, papers)
+            elif via == TITLE_AUTHORS_ANCHOR_VIA:
+                candidates = _title_authors_anchor_candidates(ref, anchors)
+                valid = len(candidates) == 1 and target in candidates
+            else:
+                valid = False
+            if valid:
                 edge_set.add((source_paper, target))
     return edge_set
 
@@ -1077,16 +1164,11 @@ def main(argv=None):
         )
         new_cnt += 1
 
-    # --- strong-ID reference resolution + citation edges (no network, no fuzzy) ---
-    refs_resolved = 0
-    refs_unresolved = 0
-    arxiv_resolved = 0
-    doi_resolved = 0
-    # track if refs/papers/edges were mutated during resolution
+    # --- strong-ID resolution, anchored title+author fallback, and citation edges ---
     refs_resolve_dirty = False
     papers_before = len(papers)
-    # build deduplicated edges from resolved refs
-    # resolve each ref
+
+    # Strong IDs are resolved first so only current strong-ID resolutions become anchors.
     for doc_sha, entry in refs_cache.items():
         manifest_entry = manifest.get(doc_sha)
         if not manifest_entry or not manifest_entry.get("paper_id"):
@@ -1096,33 +1178,45 @@ def main(argv=None):
         if source_paper not in papers:
             continue
         for ref in entry.get("refs", []):
-            paper_id, via, changed = _resolve_ref(papers, ref)
+            _, _, changed = _resolve_ref(papers, ref)
             refs_resolve_dirty |= changed
-            if not paper_id:
-                refs_unresolved += 1
+
+    anchors = _build_strong_id_anchor_set(refs_cache, papers)
+    fallback_unique = fallback_ambiguous = fallback_no_match = 0
+    for entry in refs_cache.values():
+        for ref in entry.get("refs", []):
+            if _is_current_strong_resolution(ref, papers):
                 continue
-            if via == "arxiv":
-                arxiv_resolved += 1
-            elif via == "doi":
-                doi_resolved += 1
-            refs_resolved += 1
-    # count unresolved (refs without strong ID or without paper_id after attempt)
-    if refs_resolved == 0 and refs_unresolved == 0:
-        # we counted only resolved in loop; need to count unresolved by scanning
-        for entry in refs_cache.values():
-            for ref in entry.get("refs", []):
-                if ref.get("status") != "resolved":
-                    # check if it has strong ID but was not resolved due to missing via? Actually all with doi/arxiv should be resolved now
-                    # so remaining unresolved are those without doi/arxiv
-                    if "paper_id" not in ref:
-                        refs_unresolved += 1
-        # adjust double-count: refs_resolved already counted, refs_unresolved now correct
-        # but we already incremented unresolved for those without strong ID during loop; need to ensure not double
-        # Simpler: recompute totals for reporting
-        arxiv_resolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("resolved_via") == "arxiv")
-        doi_resolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("resolved_via") == "doi")
-        refs_resolved = arxiv_resolved + doi_resolved
-        refs_unresolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("status") != "resolved")
+            cached_fallback = ref.get("resolved_via") == TITLE_AUTHORS_ANCHOR_VIA
+            if _has_strong_evidence(ref):
+                continue
+            if not cached_fallback and ref.get("status") == "resolved":
+                continue
+            if not _has_complete_title_author_evidence(ref):
+                if cached_fallback:
+                    refs_resolve_dirty |= _clear_ref_resolution(ref)
+                continue
+            _, changed, candidate_count = _resolve_title_authors_anchor(ref, anchors)
+            refs_resolve_dirty |= changed
+            if candidate_count == 1:
+                fallback_unique += 1
+            elif candidate_count == 0:
+                fallback_no_match += 1
+            else:
+                fallback_ambiguous += 1
+
+    total_refs = sum(len(e.get("refs", [])) for e in refs_cache.values())
+    arxiv_resolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("resolved_via") == "arxiv")
+    doi_resolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("resolved_via") == "doi")
+    title_authors_resolved = sum(
+        1
+        for e in refs_cache.values()
+        for r in e.get("refs", [])
+        if r.get("resolved_via") == TITLE_AUTHORS_ANCHOR_VIA
+    )
+    refs_resolved = arxiv_resolved + doi_resolved + title_authors_resolved
+    refs_unresolved = total_refs - refs_resolved
+
     # graph.json is a cache; citation edges come only from current resolved refs.
     pruned_papers = _prune_orphan_papers(papers, refs_cache, manifest)
     edge_set = _build_current_edges(refs_cache, manifest, papers)
@@ -1159,19 +1253,17 @@ def main(argv=None):
     if refs_needs_save:
         save_json(REFS, refs_cache)
 
-    # recompute totals for report (in case we double-counted earlier)
-    total_refs = sum(len(e.get("refs", [])) for e in refs_cache.values())
-    arxiv_resolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("resolved_via") == "arxiv")
-    doi_resolved = sum(1 for e in refs_cache.values() for r in e.get("refs", []) if r.get("resolved_via") == "doi")
-    refs_resolved = arxiv_resolved + doi_resolved
-    refs_unresolved = total_refs - refs_resolved
-
     print(
         f"\ndone: scanned={len(pdfs)} new={new_cnt} reconciled={reconcile_cnt}"
         f" skip={skip_cnt} refs_written={refs_written}"
     )
     print(
-        f"refs: total={total_refs}  arxiv={arxiv_resolved}  doi={doi_resolved}  unresolved={refs_unresolved}"
+        f"refs: total={total_refs}  arxiv={arxiv_resolved}  doi={doi_resolved}"
+        f"  title_authors_anchor={title_authors_resolved}  unresolved={refs_unresolved}"
+    )
+    print(
+        f"fallback: unique={fallback_unique}  ambiguous={fallback_ambiguous}"
+        f"  no_match={fallback_no_match}"
     )
     print(
         f"identity: documents={len(manifest)} papers={len(papers)} (was {papers_before})"
