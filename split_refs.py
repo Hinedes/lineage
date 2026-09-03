@@ -9,6 +9,8 @@ Covers 35-paper corpus in docs/.
 """
 import re
 
+REF_SPLITTER_VERSION = 2
+
 BLOCK = {"In","URL","ISBN","DOI","Vol","Proc","IEEE","ACM","Ed","Eds","The","Accessed","arXiv","Available","Crossref","Retrieved","Figure","Table","Fig","Listing","Equation"}
 
 RE_SURNAME_TIGHT = re.compile(r"^[A-Z][\w'\u2019\-]+,\s*[A-Z][\.;,]")
@@ -28,14 +30,14 @@ def is_head(s: str) -> bool:
     m = re.match(r"[A-Za-z][\w@&'\u2019\-]*", t)
     if not m or m.group() in BLOCK:
         return False
+    if t[0].islower():
+        return False
     if RE_ORG_NEW.match(t):
         return True
     if RE_ORG_SIMPLE.match(t):
         return True
     if RE_ORG_MULTI.match(t):
         return True
-    if t[0].islower():
-        return False
     if RE_SURNAME_TIGHT.match(t):
         return True
     return bool(RE_FULLNAME.match(t) or RE_INIT_DOT.match(t) or RE_INIT_SPACE.match(t) or RE_ORG.match(t))

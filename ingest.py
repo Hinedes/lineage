@@ -39,7 +39,7 @@ from reconcile import (
     parse_author_list,
     reconcile_document,
 )
-from split_refs import split_bib
+from split_refs import REF_SPLITTER_VERSION, split_bib
 
 ARXIV_FN = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?", re.I)
 # vertical side stamp unique to arXiv PDFs — filename-independent, survives renames
@@ -557,6 +557,37 @@ def _migrate_refs_cache(refs_cache: dict) -> bool:
     return mutated
 
 
+def _migrate_splitter_entry(entry: dict, mode: str, raw_refs: list[str]) -> tuple[bool, bool]:
+    """Upgrade one cached split, replacing refs only when raw boundaries changed."""
+    version = entry.get("splitter_version")
+    if isinstance(version, int) and version >= REF_SPLITTER_VERSION:
+        return False, False
+
+    cached_refs = entry.get("refs", [])
+    cached_raw = []
+    valid_cached_refs = isinstance(cached_refs, list)
+    if valid_cached_refs:
+        for ref in cached_refs:
+            if isinstance(ref, str):
+                cached_raw.append(ref)
+            elif isinstance(ref, dict) and isinstance(ref.get("raw"), str):
+                cached_raw.append(ref["raw"])
+            else:
+                valid_cached_refs = False
+                break
+
+    if valid_cached_refs and cached_raw == raw_refs:
+        if cached_refs and all(isinstance(ref, str) for ref in cached_refs):
+            entry["refs"] = [_new_ref(i, raw) for i, raw in enumerate(raw_refs)]
+        entry["splitter_version"] = REF_SPLITTER_VERSION
+        return True, False
+
+    entry["mode"] = mode
+    entry["splitter_version"] = REF_SPLITTER_VERSION
+    entry["refs"] = [_new_ref(i, raw) for i, raw in enumerate(raw_refs)]
+    return True, True
+
+
 def _migrate_papers_cache(papers: dict) -> bool:
     """Remove legacy paper-level arXiv versions; refs/documents keep their versions."""
     mutated = False
@@ -1026,7 +1057,7 @@ def main(argv=None):
     manifest = load_json(MANIFEST, {})
     papers = load_json(PAPERS, {})
     graph = load_json(GRAPH, {"nodes": [], "edges": []})
-    refs_cache = load_json(REFS, {})  # sha256 -> {mode, refs: [{index, raw}]}
+    refs_cache = load_json(REFS, {})  # sha256 -> {mode, splitter_version, refs: [{index, raw}]}
     # backward compat: migrate old string refs to object refs
     refs_migrated = _migrate_refs_cache(refs_cache)
     papers_migrated = _migrate_papers_cache(papers)
@@ -1040,6 +1071,7 @@ def main(argv=None):
     }
 
     new_cnt = skip_cnt = reconcile_cnt = refs_written = 0
+    manifest_dirty = False
     seen_this_run = set()
     refs_dirty = refs_migrated
 
@@ -1054,6 +1086,35 @@ def main(argv=None):
         existing = manifest.get(h)
         needs_reconciliation = not existing or not existing.get("paper_id")
 
+        if existing and h in refs_cache:
+            entry = refs_cache[h]
+            splitter_version = entry.get("splitter_version") if isinstance(entry, dict) else None
+            if not isinstance(splitter_version, int) or splitter_version < REF_SPLITTER_VERSION:
+                refreshed = ingest_one(pdf, h, {})
+                if refreshed.get("error"):
+                    print(
+                        f"warn  {pdf.name}  {h[:8]}  splitter migration skipped: "
+                        f"{refreshed['error']}"
+                    )
+                else:
+                    old_count = len(entry.get("refs", [])) if isinstance(entry.get("refs"), list) else 0
+                    migrated, boundaries_changed = _migrate_splitter_entry(
+                        entry,
+                        refreshed.get("mode"),
+                        refreshed.get("refs", []),
+                    )
+                    if migrated:
+                        refs_dirty = True
+                        refs_written += 1
+                        if boundaries_changed:
+                            manifest[h]["references"] = len(entry["refs"])
+                            manifest[h]["mode"] = entry.get("mode")
+                            manifest_dirty = True
+                        print(
+                            f"migrate {pdf.name}  {h[:8]}  splitter={old_count}->{len(entry['refs'])}"
+                            f"  {'boundaries changed' if boundaries_changed else 'raw unchanged'}"
+                        )
+
         if existing and not needs_reconciliation:
             # ensure refs are cached even for skips (backfill/migrate) — now with evidence
             if h not in refs_cache:
@@ -1061,6 +1122,7 @@ def main(argv=None):
                 rec_tmp = ingest_one(pdf, h, ident_tmp)
                 refs_cache[h] = {
                     "mode": rec_tmp.get("mode"),
+                    "splitter_version": REF_SPLITTER_VERSION,
                     "refs": [_new_ref(i, s) for i, s in enumerate(rec_tmp.get("refs", []))],
                 }
                 refs_written += 1
@@ -1109,6 +1171,7 @@ def main(argv=None):
                 rec_tmp = ingest_one(pdf, h, ident)
                 refs_cache[h] = {
                     "mode": rec_tmp.get("mode"),
+                    "splitter_version": REF_SPLITTER_VERSION,
                     "refs": [_new_ref(i, s) for i, s in enumerate(rec_tmp.get("refs", []))],
                 }
                 refs_written += 1
@@ -1137,6 +1200,7 @@ def main(argv=None):
         # cache the split refs as stable per-reference records (index + raw + deterministic evidence)
         refs_cache[h] = {
             "mode": rec.get("mode"),
+            "splitter_version": REF_SPLITTER_VERSION,
             "refs": [_new_ref(i, s) for i, s in enumerate(rec.get("refs", []))],
         }
         refs_written += 1
@@ -1239,7 +1303,7 @@ def main(argv=None):
             graph["edges"] = new_edges
             graph_dirty = True
 
-    manifest_dirty = new_cnt > 0 or reconcile_cnt > 0
+    manifest_dirty |= new_cnt > 0 or reconcile_cnt > 0
     if manifest_dirty:
         save_json(MANIFEST, manifest)
     papers_dirty = papers_migrated or len(papers) != papers_before or refs_resolve_dirty or bool(pruned_papers)
