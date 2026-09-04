@@ -122,7 +122,7 @@ _VENUE_PREFIX = (
     r"american\s+mathematical\s+society|springer|nature|neurips|icml|iclr|cvpr|"
     r"acl|emnlp|distill|dokl|commun|sn)"
 )
-REF_EVIDENCE_VERSION = 7
+REF_EVIDENCE_VERSION = 8
 DERIVED_EVIDENCE_FIELDS = (
     "doi", "arxiv", "arxiv_version", "year", "title", "title_norm", "authors", "authors_norm",
     "authors_complete",

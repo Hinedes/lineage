@@ -51,18 +51,25 @@ class ReconcileTests(unittest.TestCase):
                 "https://arxiv.org/pdf/2310." + chr(10) + "15154",
                 ("2310.15154", None),
             ),
+            ("http://arxiv.org/abs/1811. 03962", ("1811.03962", None)),
+            (
+                "http://arxiv.org/pdf/1412." + chr(10) + "6980",
+                ("1412.6980", None),
+            ),
         )
         for raw, expected in cases:
             with self.subTest(raw=raw):
                 self.assertEqual(extract_arxiv(raw), expected)
 
     def test_whitespace_damaged_arxiv_is_masked_before_year_extraction(self):
-        raw = "https://arxiv.org/abs/2203." + chr(10) + "02155, 2022."
+        for protocol in ("https", "http"):
+            raw = f"{protocol}://arxiv.org/abs/2203." + chr(10) + "02155, 2022."
 
-        ref = _parse_reference(raw)
+            ref = _parse_reference(raw)
 
-        self.assertEqual(ref["arxiv"], "2203.02155")
-        self.assertEqual(ref["year"], "2022")
+            with self.subTest(protocol=protocol):
+                self.assertEqual(ref["arxiv"], "2203.02155")
+                self.assertEqual(ref["year"], "2022")
 
     def test_whitespace_damaged_arxiv_without_year_has_no_fake_year(self):
         raw = "https://arxiv.org/abs/2203." + chr(10) + "02155"
@@ -73,18 +80,20 @@ class ReconcileTests(unittest.TestCase):
         self.assertNotIn("year", ref)
 
     def test_doi_suppresses_only_whitespace_arxiv_repair(self):
-        raw = (
-            "Citation A. First citation title, 2024. "
-            "doi:10.18653/v1/2024.acl-long.44. "
-            "Citation B. Second citation title, 2019. "
-            "https://arxiv.org/abs/1911. 11641."
-        )
+        for protocol in ("https", "http"):
+            raw = (
+                "Citation A. First citation title, 2024. "
+                "doi:10.18653/v1/2024.acl-long.44. "
+                "Citation B. Second citation title, 2019. "
+                f"{protocol}://arxiv.org/abs/1911. 11641."
+            )
 
-        ref = _parse_reference(raw)
+            ref = _parse_reference(raw)
 
-        self.assertEqual(ref["doi"], "10.18653/v1/2024.acl-long.44")
-        self.assertNotIn("arxiv", ref)
-        self.assertEqual(ref["year"], "2024")
+            with self.subTest(protocol=protocol):
+                self.assertEqual(ref["doi"], "10.18653/v1/2024.acl-long.44")
+                self.assertNotIn("arxiv", ref)
+                self.assertEqual(ref["year"], "2024")
 
     def test_contiguous_doi_and_arxiv_remain_supported(self):
         ref = _parse_reference(
@@ -99,6 +108,11 @@ class ReconcileTests(unittest.TestCase):
         ref = _parse_reference("2203. 02155")
 
         self.assertNotIn("arxiv", ref)
+
+        self.assertNotIn(
+            "arxiv",
+            _parse_reference("http://example.org/2203. 02155"),
+        )
 
     def test_contiguous_arxiv_behavior_is_unchanged(self):
         self.assertEqual(

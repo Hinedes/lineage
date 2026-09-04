@@ -26,7 +26,7 @@ ARXIV_RE = re.compile(
     re.I,
 )
 ARXIV_WHITESPACE_RE = re.compile(
-    r"https://arxiv\.org/(?:abs|pdf)/"
+    r"https?://arxiv\.org/(?:abs|pdf)/"
     r"(?P<year>\d{4})\.\s+(?P<number>\d{4,5})(?P<version>v\d+)?",
     re.I,
 )
