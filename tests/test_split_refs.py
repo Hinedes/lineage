@@ -19,6 +19,20 @@ class SplitterTests(unittest.TestCase):
         self.assertTrue(is_head("Smith, J., Doe, A. 2020. A title."))
         self.assertTrue(is_head("Jane Smith and Alice Doe. 2020. A title."))
 
+    def test_corpus_uppercase_continuations_are_not_heads(self):
+        for line in (
+            "Trans. Image Processing 19, 6 (2010), 1451–1464.",
+            "Proceedings. ICASSP99 (Cat. No. 99CH36258), Vol 5, pp. 2443--2446.",
+            "Language Model Fine-tuning for Text Classification.",
+            "Computational Linguistics: Human Language Technologies, pages 142--150.",
+            "Natural Language Processing, pages 3045--3059.",
+            "Long Papers, pages 328--339.",
+        ):
+            with self.subTest(line=line):
+                self.assertFalse(is_head(line))
+
+        self.assertTrue(is_head("Long Ouyang, Jeff Wu, Xu Jiang. 2022. A title."))
+
     def test_bracket_mode_is_unchanged(self):
         mode, refs = split_bib(
             "References:\n"

@@ -9,9 +9,21 @@ Covers 35-paper corpus in docs/.
 """
 import re
 
-REF_SPLITTER_VERSION = 2
+REF_SPLITTER_VERSION = 3
 
 BLOCK = {"In","URL","ISBN","DOI","Vol","Proc","IEEE","ACM","Ed","Eds","The","Accessed","arXiv","Available","Crossref","Retrieved","Figure","Table","Fig","Listing","Equation"}
+
+# Corpus-confirmed venue/title tails that the generic head patterns mistake for authors.
+RE_KNOWN_CONTINUATION = re.compile(
+    r"^(?:Trans\.|Proceedings\.|Conference Track\b|Information Processing\b|"
+    r"Information Systems\b|Processing Systems\b|Computational Linguistics\b|"
+    r"Language Processing\b|Language Model\b|Language Resources\b|"
+    r"Language Technologies\b|Linguistics\b|Vision Conference\b|"
+    r"Computer Visual\b|Res Zoom\b|Learn\. Res\.|System Demonstrations\b|"
+    r"Machine Learning\b|American Chapter\b|Empirical Methods\b|"
+    r"Neural Information\b|Natural Language\b|Long (?:Beach|Papers)\b)",
+    re.IGNORECASE,
+)
 
 RE_SURNAME_TIGHT = re.compile(r"^[A-Z][\w'\u2019\-]+,\s*[A-Z][\.;,]")
 RE_FULLNAME = re.compile(r"^[A-Z][a-z'\u2019]+(?:-[A-Z][a-z'\u2019]+)*\s+[A-Z]")
@@ -26,6 +38,8 @@ YEAR = re.compile(r"\b(?:19|20)\d{2}[a-z]?\b")
 def is_head(s: str) -> bool:
     t = s.strip()
     if len(t) < 4 or t[0].isdigit() or t[0] == '(':
+        return False
+    if RE_KNOWN_CONTINUATION.match(t):
         return False
     m = re.match(r"[A-Za-z][\w@&'\u2019\-]*", t)
     if not m or m.group() in BLOCK:
