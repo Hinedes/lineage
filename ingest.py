@@ -122,7 +122,7 @@ _VENUE_PREFIX = (
     r"american\s+mathematical\s+society|springer|nature|neurips|icml|iclr|cvpr|"
     r"acl|emnlp|distill|dokl|commun|sn)"
 )
-REF_EVIDENCE_VERSION = 8
+REF_EVIDENCE_VERSION = 9
 DERIVED_EVIDENCE_FIELDS = (
     "doi", "arxiv", "arxiv_version", "year", "title", "title_norm", "authors", "authors_norm",
     "authors_complete",
@@ -290,10 +290,6 @@ def _title_from_rest(text: str) -> str | None:
         return None
     if re.match(r"^in(?:\s*the)?\b", rest, re.I) and re.search(r"\b(?:conference|journal|proceedings)\b", rest[:180], re.I):
         return None
-    if re.search(r"\b(?:conference|journal)\b", rest[:120], re.I) and re.search(r"\b(?:vol\.?|volume|pp\.?|pages)\s*\d", rest[:180], re.I):
-        return None
-    if re.search(r"\b(?:vol\.?|volume)\s*\d.*\b(?:pp\.?|pages)\s*\d", rest[:220], re.I):
-        return None
     if re.match(r"^(?:ieee|acm|siam)\b", rest, re.I) and re.search(r"\bconference\b", rest[:180], re.I):
         return None
     rest = re.split(r",\s+volume\s+\d+\s+of(?=[A-Z])", rest, maxsplit=1, flags=re.I)[0]
@@ -313,8 +309,17 @@ def _title_from_rest(text: str) -> str | None:
         title = _clean_title(candidate)
         if _TITLE_WRAP_RE.search(title):
             return None
+        if (
+            re.search(r"\b(?:conference|journal)\b", candidate[:120], re.I)
+            and re.search(r"\b(?:vol\.?|volume|pp\.?|pages)\s*\d", candidate[:180], re.I)
+        ) or re.search(r"\b(?:vol\.?|volume)\s*\d.*\b(?:pp\.?|pages)\s*\d", candidate[:220], re.I):
+            return None
         if len(title) >= 4 and re.search(r"[A-Za-z]", title):
             return title
+    if re.search(r"\b(?:conference|journal)\b", rest[:120], re.I) and re.search(r"\b(?:vol\.?|volume|pp\.?|pages)\s*\d", rest[:180], re.I):
+        return None
+    if re.search(r"\b(?:vol\.?|volume)\s*\d.*\b(?:pp\.?|pages)\s*\d", rest[:220], re.I):
+        return None
     url = re.search(r"\s+(?=(?:https?://|www\.|(?:arxiv|doi)\s*:))", rest, re.I)
     if url:
         rest = rest[:url.start()]

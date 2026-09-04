@@ -318,6 +318,32 @@ class RefEvidenceTests(unittest.TestCase):
         self.assertNotIn("http", with_url["title"])
         self.assertNotIn("title", venue_only)
 
+    def test_title_sentence_precedes_conference_pages_tail(self):
+        cases = (
+            (
+                "David Bau, Steven Liu, Tongzhou Wang, Jun-Yan Zhu, and Antonio Torralba. "
+                "Rewriting a deep generative model. In European conference on computer vision, "
+                "pages 351--369. Springer, 2020.",
+                "Rewriting a deep generative model",
+            ),
+            (
+                "Alexander Kirillov, Eric Mintun, Nikhila Ravi, Hanzi Mao, Chloe Rolland, "
+                "Laura Gustafson, Tete Xiao, Spencer Whitehead, Alexander C. Berg, Wan-Yen Lo, "
+                "Piotr Dollar, and Ross Girshick. Segment anything. In IEEE/CVF International "
+                "Conference on Computer Vision (ICCV), pages 4015--4026, October 2023.",
+                "Segment anything",
+            ),
+            (
+                "Michael McCloskey and Neal J. Cohen. 1989. Catas-trophic interference in "
+                "connectionist networks: the sequential learning problem. In Psychology of "
+                "Learning and Motivation, volume 24, pages 109--165.",
+                "Catas-trophic interference in connectionist networks: the sequential learning problem",
+            ),
+        )
+        for raw, expected_title in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(_parse_reference(raw)["title"], expected_title)
+
     def test_truncated_title_is_not_emitted(self):
         ref = _parse_reference("Lisa Torrey and Jude Shavlik. 2010. Transfer learn-")
 
