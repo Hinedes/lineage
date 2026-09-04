@@ -1,5 +1,6 @@
 import unittest
 
+from ingest import _parse_reference
 from reconcile import (
     authors_compatible,
     extract_arxiv,
@@ -38,6 +39,72 @@ class ReconcileTests(unittest.TestCase):
         base, version = extract_arxiv("arXiv:2203.05482v3 [cs.LG] 1 Jul 2022")
         self.assertEqual(base, "2203.05482")
         self.assertEqual(version, "v3")
+
+    def test_whitespace_damaged_arxiv_urls_are_recovered(self):
+        cases = (
+            ("https://arxiv.org/abs/2203. 02155", ("2203.02155", None)),
+            (
+                "https://arxiv.org/abs/2203." + chr(10) + "02155v2",
+                ("2203.02155", "v2"),
+            ),
+            (
+                "https://arxiv.org/pdf/2310." + chr(10) + "15154",
+                ("2310.15154", None),
+            ),
+        )
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(extract_arxiv(raw), expected)
+
+    def test_whitespace_damaged_arxiv_is_masked_before_year_extraction(self):
+        raw = "https://arxiv.org/abs/2203." + chr(10) + "02155, 2022."
+
+        ref = _parse_reference(raw)
+
+        self.assertEqual(ref["arxiv"], "2203.02155")
+        self.assertEqual(ref["year"], "2022")
+
+    def test_whitespace_damaged_arxiv_without_year_has_no_fake_year(self):
+        raw = "https://arxiv.org/abs/2203." + chr(10) + "02155"
+
+        ref = _parse_reference(raw)
+
+        self.assertEqual(ref["arxiv"], "2203.02155")
+        self.assertNotIn("year", ref)
+
+    def test_doi_suppresses_only_whitespace_arxiv_repair(self):
+        raw = (
+            "Citation A. First citation title, 2024. "
+            "doi:10.18653/v1/2024.acl-long.44. "
+            "Citation B. Second citation title, 2019. "
+            "https://arxiv.org/abs/1911. 11641."
+        )
+
+        ref = _parse_reference(raw)
+
+        self.assertEqual(ref["doi"], "10.18653/v1/2024.acl-long.44")
+        self.assertNotIn("arxiv", ref)
+        self.assertEqual(ref["year"], "2024")
+
+    def test_contiguous_doi_and_arxiv_remain_supported(self):
+        ref = _parse_reference(
+            "Citation. 2024. doi:10.18653/v1/2024.acl-long.44. arXiv:1911.11641v2"
+        )
+
+        self.assertEqual(ref["doi"], "10.18653/v1/2024.acl-long.44")
+        self.assertEqual(ref["arxiv"], "1911.11641")
+        self.assertEqual(ref["arxiv_version"], "v2")
+
+    def test_bare_whitespace_damaged_id_is_not_an_arxiv_id(self):
+        ref = _parse_reference("2203. 02155")
+
+        self.assertNotIn("arxiv", ref)
+
+    def test_contiguous_arxiv_behavior_is_unchanged(self):
+        self.assertEqual(
+            extract_arxiv("arXiv:2203.02155v2"),
+            ("2203.02155", "v2"),
+        )
 
     def test_arxiv_versions_reconcile_to_one_paper(self):
         papers = {}

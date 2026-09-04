@@ -679,6 +679,64 @@ class RefEvidenceTests(unittest.TestCase):
         self.assertEqual(ref["title"], "Blindsight is unlike normal conscious vision: evidence from an exclusion task")
         self.assertEqual(ref["title_norm"], "blindsight is unlike normal conscious vision evidence from an exclusion task")
 
+    def test_evidence_migration_recovers_whitespace_arxiv_and_strengthens_resolution(self):
+        raw = "Jane Smith and Alice Doe. A title. https://arxiv.org/abs/2203." + chr(10) + "02155, 2022."
+        target = "arxiv:2203.02155"
+        ref = {
+            "index": 0,
+            "raw": raw,
+            "paper_id": target,
+            "status": "resolved",
+            "resolved_via": TITLE_AUTHORS_ANCHOR_VIA,
+            "evidence_version": REF_EVIDENCE_VERSION - 1,
+        }
+        cache = {"doc": {"refs": [ref]}}
+        papers = {target: _paper(target, arxiv="2203.02155")}
+
+        self.assertTrue(_migrate_refs_cache(cache))
+        self.assertEqual(ref["arxiv"], "2203.02155")
+        self.assertEqual(ref["year"], "2022")
+        self.assertNotIn("paper_id", ref)
+        self.assertNotIn("status", ref)
+        self.assertNotIn("resolved_via", ref)
+
+        paper_id, via, changed = _resolve_ref(papers, ref)
+
+        self.assertTrue(changed)
+        self.assertEqual((paper_id, via), (target, "arxiv"))
+
+    def test_evidence_migration_suppresses_whitespace_arxiv_when_doi_exists(self):
+        raw = (
+            "Citation A. First citation title, 2024. "
+            "doi:10.18653/v1/2024.acl-long.44. "
+            "Citation B. Second citation title, 2019. "
+            "https://arxiv.org/abs/1911. 11641."
+        )
+        doi = "10.18653/v1/2024.acl-long.44"
+        target = f"doi:{doi}"
+        ref = {
+            "index": 0,
+            "raw": raw,
+            "doi": doi,
+            "arxiv": "1911.11641",
+            "paper_id": target,
+            "status": "resolved",
+            "resolved_via": "doi",
+            "evidence_version": REF_EVIDENCE_VERSION - 1,
+        }
+        cache = {"doc": {"refs": [ref]}}
+        papers = {target: _paper(target, doi=doi)}
+
+        self.assertTrue(_migrate_refs_cache(cache))
+        self.assertEqual(ref["doi"], doi)
+        self.assertNotIn("arxiv", ref)
+        self.assertEqual(ref["year"], "2024")
+
+        paper_id, via, changed = _resolve_ref(papers, ref)
+
+        self.assertTrue(changed)
+        self.assertEqual((paper_id, via), (target, "doi"))
+
     def test_evidence_migration_preserves_stable_reference_fields(self):
         raw = "John Smith and Alice Doe. A title. 2021."
         stable = {

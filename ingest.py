@@ -32,6 +32,7 @@ from reconcile import (
     extract_arxiv,
     extract_authors_from_front_page,
     extract_doi,
+    ARXIV_WHITESPACE_RE,
     make_evidence,
     normalize_arxiv,
     normalize_doi,
@@ -121,7 +122,7 @@ _VENUE_PREFIX = (
     r"american\s+mathematical\s+society|springer|nature|neurips|icml|iclr|cvpr|"
     r"acl|emnlp|distill|dokl|commun|sn)"
 )
-REF_EVIDENCE_VERSION = 5
+REF_EVIDENCE_VERSION = 7
 DERIVED_EVIDENCE_FIELDS = (
     "doi", "arxiv", "arxiv_version", "year", "title", "title_norm", "authors", "authors_norm",
     "authors_complete",
@@ -405,7 +406,7 @@ def _title_author_evidence(raw: str) -> dict:
 
 def _mask_year_exclusions(raw: str) -> str:
     masked = list(raw or "")
-    for pattern in (_URL_RE, _URL_PATH_YEAR_RE, _DOI_ID_RE, _ARXIV_ID_RE):
+    for pattern in (ARXIV_WHITESPACE_RE, _URL_RE, _URL_PATH_YEAR_RE, _DOI_ID_RE, _ARXIV_ID_RE):
         for match in pattern.finditer(raw or ""):
             for index in range(*match.span()):
                 masked[index] = " "
@@ -477,7 +478,8 @@ def _extract_publication_year(raw: str) -> str | None:
 def _parse_reference(raw: str) -> dict:
     """Deterministic evidence from a raw split reference — no resolution, no network."""
     doi = extract_doi(raw)
-    arxiv_base, arxiv_version = extract_arxiv(raw)
+    # A DOI makes whitespace repair unsafe for concatenated citations; contiguous arXiv remains valid.
+    arxiv_base, arxiv_version = extract_arxiv(raw, allow_whitespace_repair=not bool(doi))
     # also try normalize_arxiv for bare IDs without 'arXiv:' prefix (e.g. '1905.03277v2')
     if not arxiv_base:
         # fallback: search for bare arXiv ID pattern

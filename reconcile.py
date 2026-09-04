@@ -25,6 +25,11 @@ ARXIV_RE = re.compile(
     r"(?P<version>v\d+)?",
     re.I,
 )
+ARXIV_WHITESPACE_RE = re.compile(
+    r"https://arxiv\.org/(?:abs|pdf)/"
+    r"(?P<year>\d{4})\.\s+(?P<number>\d{4,5})(?P<version>v\d+)?",
+    re.I,
+)
 
 _DASHES = str.maketrans({
     "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-",
@@ -74,13 +79,23 @@ def normalize_arxiv(value: str | None) -> tuple[str | None, str | None]:
     return base, version.casefold() if version else None
 
 
-def extract_arxiv(text: str) -> tuple[str | None, str | None]:
+def extract_arxiv(
+    text: str, *, allow_whitespace_repair: bool = True
+) -> tuple[str | None, str | None]:
     """Read an explicit arXiv marker from PDF text, including rotated margin text."""
     m = re.search(
         r"arxiv\s*:\s*(\d{4}\.\d{4,5}|[a-z][a-z0-9.-]+/\d{7})(v\d+)?",
         text or "",
         re.I,
     )
+    if not m and allow_whitespace_repair:
+        m_ws = ARXIV_WHITESPACE_RE.search(text or "")
+        if not m_ws:
+            return None, None
+        return (
+            f"{m_ws.group('year')}.{m_ws.group('number')}".casefold(),
+            m_ws.group("version").casefold() if m_ws.group("version") else None,
+        )
     if not m:
         return None, None
     return m.group(1).casefold(), m.group(2).casefold() if m.group(2) else None
