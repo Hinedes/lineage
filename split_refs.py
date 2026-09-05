@@ -9,7 +9,7 @@ Covers 35-paper corpus in docs/.
 """
 import re
 
-REF_SPLITTER_VERSION = 3
+REF_SPLITTER_VERSION = 4
 
 BLOCK = {"In","URL","ISBN","DOI","Vol","Proc","IEEE","ACM","Ed","Eds","The","Accessed","arXiv","Available","Crossref","Retrieved","Figure","Table","Fig","Listing","Equation"}
 

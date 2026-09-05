@@ -6,12 +6,13 @@ from pypdf import PdfReader
 
 HEADING = re.compile(r"(?m)^\s*(References|Bibliography)\s*:?\s*$", re.IGNORECASE)
 
-# post-reference section starts; corpus-demonstrated forms: "Appendix",
-# "A Appendix", "A. Appendix", "• Appendices". Mid-sentence mentions
-# ("described in Appendix") don't start a line, so they never match.
+# post-reference section starts; corpus-demonstrated forms include
+# "S SUPPLEMENT", "Appendix", "A Appendix", "A. Appendix", and
+# "• Appendices". Mid-sentence mentions don't start a line, so they never match.
 STOP = re.compile(
-    r"(?m)^[ \t\u2022]*(?:[A-Z]\.\s*|[A-Z]\s+)?"
-    r"(Appendices|Supplementary Material|Supplemental Material|Appendix)\b",
+    r"(?m)^(?:[ \t\u2022]*(?:[A-Z]\.\s*|[A-Z]\s+)?"
+    r"(Appendices|Supplementary Material|Supplemental Material|Appendix)\b"
+    r"|[ \t\u2022]*S[ \t]+SUPPLEMENT[ \t]*$)",
     re.IGNORECASE,
 )
 
